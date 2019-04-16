@@ -33,19 +33,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <sys/signalfd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-
-#include <bluetooth/bluetooth.h>
 
 #include <glib.h>
 
 #include <dbus/dbus.h>
 
-#include <gdbus/gdbus.h>
+#include "lib/bluetooth.h"
+#include "lib/sdp.h"
+
+#include "gdbus/gdbus.h"
 
 #include "log.h"
+#include "backtrace.h"
 
 #include "lib/uuid.h"
 #include "hcid.h"
@@ -55,7 +58,6 @@
 #include "dbus-common.h"
 #include "agent.h"
 #include "profile.h"
-#include "gatt.h"
 #include "systemd.h"
 
 #define BLUEZ_NAME "org.bluez"
@@ -67,19 +69,54 @@
 
 struct main_opts main_opts;
 static GKeyFile *main_conf;
+static char *main_conf_file_path;
 
-static const char * const supported_options[] = {
+static enum {
+	MPS_OFF,
+	MPS_SINGLE,
+	MPS_MULTIPLE,
+} mps = MPS_OFF;
+
+static const char *supported_options[] = {
 	"Name",
 	"Class",
 	"DiscoverableTimeout",
-	"AlwaysPairable",
 	"PairableTimeout",
-	"AutoConnectTimeout",
 	"DeviceID",
 	"ReverseServiceDiscovery",
 	"NameResolving",
 	"DebugKeys",
+	"ControllerMode",
+	"MultiProfile",
+	"FastConnectable",
+	"Privacy",
+	NULL
 };
+
+static const char *policy_options[] = {
+	"ReconnectUUIDs",
+	"ReconnectAttempts",
+	"ReconnectIntervals",
+	"AutoEnable",
+	NULL
+};
+
+static const char *gatt_options[] = {
+	"Cache",
+	"MinEncKeySize",
+	NULL
+};
+
+static const struct group_table {
+	const char *name;
+	const char **options;
+} valid_groups[] = {
+	{ "General",	supported_options },
+	{ "Policy",	policy_options },
+	{ "GATT",	gatt_options },
+	{ }
+};
+
 
 GKeyFile *btd_get_main_conf(void)
 {
@@ -138,11 +175,53 @@ done:
 	main_opts.did_version = version;
 }
 
-static void check_config(GKeyFile *config)
+static bt_gatt_cache_t parse_gatt_cache(const char *cache)
 {
-	const char *valid_groups[] = { "General", "Policy", NULL };
+	if (!strcmp(cache, "always")) {
+		return BT_GATT_CACHE_ALWAYS;
+	} else if (!strcmp(cache, "yes")) {
+		return BT_GATT_CACHE_YES;
+	} else if (!strcmp(cache, "no")) {
+		return BT_GATT_CACHE_NO;
+	} else {
+		DBG("Invalid value for KeepCache=%s", cache);
+		return BT_GATT_CACHE_ALWAYS;
+	}
+}
+
+static void check_options(GKeyFile *config, const char *group,
+						const char **options)
+{
 	char **keys;
 	int i;
+
+	keys = g_key_file_get_keys(config, group, NULL, NULL);
+
+	for (i = 0; keys != NULL && keys[i] != NULL; i++) {
+		bool found;
+		unsigned int j;
+
+		found = false;
+		for (j = 0; options != NULL && options[j] != NULL; j++) {
+			if (g_str_equal(keys[i], options[j])) {
+				found = true;
+				break;
+			}
+		}
+
+		if (!found)
+			warn("Unknown key %s for group %s in %s",
+					keys[i], group, main_conf_file_path);
+	}
+
+	g_strfreev(keys);
+}
+
+static void check_config(GKeyFile *config)
+{
+	char **keys;
+	int i;
+	const struct group_table *group;
 
 	if (!config)
 		return;
@@ -150,41 +229,38 @@ static void check_config(GKeyFile *config)
 	keys = g_key_file_get_groups(config, NULL);
 
 	for (i = 0; keys != NULL && keys[i] != NULL; i++) {
-		const char **group;
 		bool match = false;
 
-		for (group = valid_groups; *group; group++) {
-			if (g_str_equal(keys[i], *group)) {
+		for (group = valid_groups; group && group->name ; group++) {
+			if (g_str_equal(keys[i], group->name)) {
 				match = true;
 				break;
 			}
 		}
 
 		if (!match)
-			warn("Unknown group %s in main.conf", keys[i]);
+			warn("Unknown group %s in %s", keys[i],
+						main_conf_file_path);
 	}
 
 	g_strfreev(keys);
 
-	keys = g_key_file_get_keys(config, "General", NULL, NULL);
+	for (group = valid_groups; group && group->name; group++)
+		check_options(config, group->name, group->options);
+}
 
-	for (i = 0; keys != NULL && keys[i] != NULL; i++) {
-		bool found;
-		unsigned int j;
+static int get_mode(const char *str)
+{
+	if (strcmp(str, "dual") == 0)
+		return BT_MODE_DUAL;
+	else if (strcmp(str, "bredr") == 0)
+		return BT_MODE_BREDR;
+	else if (strcmp(str, "le") == 0)
+		return BT_MODE_LE;
 
-		found = false;
-		for (j = 0; j < G_N_ELEMENTS(supported_options); j++) {
-			if (g_str_equal(keys[i], supported_options[j])) {
-				found = true;
-				break;
-			}
-		}
+	error("Unknown controller mode \"%s\"", str);
 
-		if (!found)
-			warn("Unknown key %s in main.conf", keys[i]);
-	}
-
-	g_strfreev(keys);
+	return BT_MODE_DUAL;
 }
 
 static void parse_config(GKeyFile *config)
@@ -199,7 +275,7 @@ static void parse_config(GKeyFile *config)
 
 	check_config(config);
 
-	DBG("parsing main.conf");
+	DBG("parsing %s", main_conf_file_path);
 
 	val = g_key_file_get_integer(config, "General",
 						"DiscoverableTimeout", &err);
@@ -221,14 +297,24 @@ static void parse_config(GKeyFile *config)
 		main_opts.pairto = val;
 	}
 
-	val = g_key_file_get_integer(config, "General", "AutoConnectTimeout",
-									&err);
+	str = g_key_file_get_string(config, "General", "Privacy", &err);
 	if (err) {
 		DBG("%s", err->message);
 		g_clear_error(&err);
+		main_opts.privacy = 0x00;
 	} else {
-		DBG("auto_to=%d", val);
-		main_opts.autoto = val;
+		DBG("privacy=%s", str);
+
+		if (!strcmp(str, "device"))
+			main_opts.privacy = 0x01;
+		else if (!strcmp(str, "off"))
+			main_opts.privacy = 0x00;
+		else {
+			DBG("Invalid privacy option: %s", str);
+			main_opts.privacy = 0x00;
+		}
+
+		g_free(str);
 	}
 
 	str = g_key_file_get_string(config, "General", "Name", &err);
@@ -282,6 +368,57 @@ static void parse_config(GKeyFile *config)
 		g_clear_error(&err);
 	else
 		main_opts.debug_keys = boolean;
+
+	str = g_key_file_get_string(config, "General", "ControllerMode", &err);
+	if (err) {
+		g_clear_error(&err);
+	} else {
+		DBG("ControllerMode=%s", str);
+		main_opts.mode = get_mode(str);
+		g_free(str);
+	}
+
+	str = g_key_file_get_string(config, "General", "MultiProfile", &err);
+	if (err) {
+		g_clear_error(&err);
+	} else {
+		DBG("MultiProfile=%s", str);
+
+		if (!strcmp(str, "single"))
+			mps = MPS_SINGLE;
+		else if (!strcmp(str, "multiple"))
+			mps = MPS_MULTIPLE;
+
+		g_free(str);
+	}
+
+	boolean = g_key_file_get_boolean(config, "General",
+						"FastConnectable", &err);
+	if (err)
+		g_clear_error(&err);
+	else
+		main_opts.fast_conn = boolean;
+
+	str = g_key_file_get_string(config, "GATT", "Cache", &err);
+	if (err) {
+		g_clear_error(&err);
+		main_opts.gatt_cache = BT_GATT_CACHE_ALWAYS;
+	} else {
+		main_opts.gatt_cache = parse_gatt_cache(str);
+		g_free(str);
+	}
+
+	val = g_key_file_get_integer(config, "GATT",
+						"MinEncKeySize", &err);
+	if (err) {
+		DBG("%s", err->message);
+		g_clear_error(&err);
+	} else {
+		DBG("MinEncKeySize=%d", val);
+
+		if (val >=7 && val <= 16)
+			main_opts.min_enc_key_size = val;
+	}
 }
 
 static void init_defaults(void)
@@ -307,6 +444,21 @@ static void init_defaults(void)
 	main_opts.did_version = (major << 8 | minor);
 }
 
+static void log_handler(const gchar *log_domain, GLogLevelFlags log_level,
+				const gchar *message, gpointer user_data)
+{
+	int priority;
+
+	if (log_level & (G_LOG_LEVEL_ERROR |
+				G_LOG_LEVEL_CRITICAL | G_LOG_LEVEL_WARNING))
+		priority = 0x03;
+	else
+		priority = 0x06;
+
+	btd_log(0xffff, priority, "GLib: %s", message);
+	btd_backtrace(0xffff);
+}
+
 static GMainLoop *event_loop;
 
 void btd_exit(void)
@@ -323,7 +475,7 @@ static gboolean quit_eventloop(gpointer user_data)
 static gboolean signal_handler(GIOChannel *channel, GIOCondition cond,
 							gpointer user_data)
 {
-	static unsigned int __terminated = 0;
+	static bool terminated = false;
 	struct signalfd_siginfo si;
 	ssize_t result;
 	int fd;
@@ -340,7 +492,7 @@ static gboolean signal_handler(GIOChannel *channel, GIOCondition cond,
 	switch (si.ssi_signo) {
 	case SIGINT:
 	case SIGTERM:
-		if (__terminated == 0) {
+		if (!terminated) {
 			info("Terminating");
 			g_timeout_add_seconds(SHUTDOWN_GRACE_SECONDS,
 							quit_eventloop, NULL);
@@ -349,7 +501,7 @@ static gboolean signal_handler(GIOChannel *channel, GIOCondition cond,
 			adapter_shutdown();
 		}
 
-		__terminated = 1;
+		terminated = true;
 		break;
 	case SIGUSR2:
 		__btd_toggle_debug();
@@ -400,6 +552,7 @@ static guint setup_signalfd(void)
 static char *option_debug = NULL;
 static char *option_plugin = NULL;
 static char *option_noplugin = NULL;
+static char *option_configfile = NULL;
 static gboolean option_compat = FALSE;
 static gboolean option_detach = TRUE;
 static gboolean option_version = FALSE;
@@ -415,6 +568,9 @@ static void free_options(void)
 
 	g_free(option_noplugin);
 	option_noplugin = NULL;
+
+	g_free(option_configfile);
+	option_configfile = NULL;
 }
 
 static void disconnect_dbus(void)
@@ -487,6 +643,8 @@ static GOptionEntry options[] = {
 				"Specify plugins to load", "NAME,..," },
 	{ "noplugin", 'P', 0, G_OPTION_ARG_STRING, &option_noplugin,
 				"Specify plugins not to load", "NAME,..." },
+	{ "configfile", 'f', 0, G_OPTION_ARG_STRING, &option_configfile,
+			"Specify an explicit path to the config file", "FILE"},
 	{ "compat", 'C', 0, G_OPTION_ARG_NONE, &option_compat,
 				"Provide deprecated command line interfaces" },
 	{ "experimental", 'E', 0, G_OPTION_ARG_NONE, &option_experimental,
@@ -532,15 +690,26 @@ int main(int argc, char *argv[])
 
 	umask(0077);
 
+	btd_backtrace_init();
+
 	event_loop = g_main_loop_new(NULL, FALSE);
 
 	signal = setup_signalfd();
 
 	__btd_log_init(option_debug, option_detach);
 
+	g_log_set_handler("GLib", G_LOG_LEVEL_MASK | G_LOG_FLAG_FATAL |
+							G_LOG_FLAG_RECURSION,
+							log_handler, NULL);
+
 	sd_notify(0, "STATUS=Starting up");
 
-	main_conf = load_config(CONFIGDIR "/main.conf");
+	if (option_configfile)
+		main_conf_file_path = option_configfile;
+	else
+		main_conf_file_path = CONFIGDIR "/main.conf";
+
+	main_conf = load_config(main_conf_file_path);
 
 	parse_config(main_conf);
 
@@ -554,8 +723,6 @@ int main(int argc, char *argv[])
 
 	g_dbus_set_flags(gdbus_flags);
 
-	gatt_init();
-
 	if (adapter_init() < 0) {
 		error("Adapter handling initialization failed");
 		exit(1);
@@ -565,14 +732,21 @@ int main(int argc, char *argv[])
 	btd_agent_init();
 	btd_profile_init();
 
-	if (option_compat == TRUE)
-		sdp_flags |= SDP_SERVER_COMPAT;
+	if (main_opts.mode != BT_MODE_LE) {
+		if (option_compat == TRUE)
+			sdp_flags |= SDP_SERVER_COMPAT;
 
-	start_sdp_server(sdp_mtu, sdp_flags);
+		start_sdp_server(sdp_mtu, sdp_flags);
 
-	if (main_opts.did_source > 0)
-		register_device_id(main_opts.did_source, main_opts.did_vendor,
-				main_opts.did_product, main_opts.did_version);
+		if (main_opts.did_source > 0)
+			register_device_id(main_opts.did_source,
+						main_opts.did_vendor,
+						main_opts.did_product,
+						main_opts.did_version);
+	}
+
+	if (mps != MPS_OFF)
+		register_mps(mps == MPS_MULTIPLE);
 
 	/* Loading plugins has to be done after D-Bus has been setup since
 	 * the plugins might wanna expose some paths on the bus. However the
@@ -618,11 +792,10 @@ int main(int argc, char *argv[])
 
 	adapter_cleanup();
 
-	gatt_cleanup();
-
 	rfkill_exit();
 
-	stop_sdp_server();
+	if (main_opts.mode != BT_MODE_LE)
+		stop_sdp_server();
 
 	g_main_loop_unref(event_loop);
 

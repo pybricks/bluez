@@ -21,6 +21,20 @@ Methods		void Connect()
 			If at least one profile was connected successfully this
 			method will indicate success.
 
+			For dual-mode devices only one bearer is connected at
+			time, the conditions are in the following order:
+
+				1. Connect the disconnected bearer if already
+				connected.
+
+				2. Connect first the bonded bearer. If no
+				bearers are bonded or both are skip and check
+				latest seen bearer.
+
+				3. Connect last seen bearer, in case the
+				timestamps are the same BR/EDR takes
+				precedence.
+
 			Possible errors: org.bluez.Error.NotReady
 					 org.bluez.Error.Failed
 					 org.bluez.Error.InProgress
@@ -38,6 +52,10 @@ Methods		void Connect()
 			This method can be also used to cancel a preceding
 			Connect call before a reply to it has been received.
 
+			For non-trusted devices connected over LE bearer calling
+			this method will disable incoming connections until
+			Connect method is called again.
+
 			Possible errors: org.bluez.Error.NotConnected
 
 		void ConnectProfile(string uuid)
@@ -46,9 +64,11 @@ Methods		void Connect()
 			device. The UUID provided is the remote service
 			UUID for the profile.
 
-			Possible errors: org.bluez.Error.DoesNotExist
-					 org.bluez.Error.AlreadyConnected
-					 org.bluez.Error.ConnectFailed
+			Possible errors: org.bluez.Error.Failed
+					 org.bluez.Error.InProgress
+					 org.bluez.Error.InvalidArguments
+					 org.bluez.Error.NotAvailable
+					 org.bluez.Error.NotReady
 
 		void DisconnectProfile(string uuid)
 
@@ -60,9 +80,9 @@ Methods		void Connect()
 			as long as the profile is registered this will always
 			succeed.
 
-			Possible errors: org.bluez.Error.DoesNotExist
-					 org.bluez.Error.Failed
-					 org.bluez.Error.NotConnected
+			Possible errors: org.bluez.Error.Failed
+					 org.bluez.Error.InProgress
+					 org.bluez.Error.InvalidArguments
 					 org.bluez.Error.NotSupported
 
 		void Pair()
@@ -103,6 +123,19 @@ Methods		void Connect()
 Properties	string Address [readonly]
 
 			The Bluetooth device address of the remote device.
+
+		string AddressType [readonly]
+
+			The Bluetooth device Address Type. For dual-mode and
+			BR/EDR only devices this defaults to "public". Single
+			mode LE devices may have either value. If remote device
+			uses privacy than before pairing this represents address
+			type used for connection and Identity Address after
+			pairing.
+
+			Possible values:
+				"public" - Public address
+				"random" - Random address
 
 		string Name [readonly, optional]
 
@@ -193,3 +226,44 @@ Properties	string Address [readonly]
 
 			Received Signal Strength Indicator of the remote
 			device (inquiry or advertising).
+
+		int16 TxPower [readonly, optional]
+
+			Advertised transmitted power level (inquiry or
+			advertising).
+
+		dict ManufacturerData [readonly, optional]
+
+			Manufacturer specific advertisement data. Keys are
+			16 bits Manufacturer ID followed by its byte array
+			value.
+
+		dict ServiceData [readonly, optional]
+
+			Service advertisement data. Keys are the UUIDs in
+			string format followed by its byte array value.
+
+		bool ServicesResolved [readonly]
+
+			Indicate whether or not service discovery has been
+			resolved.
+
+		array{byte} AdvertisingFlags [readonly, experimental]
+
+			The Advertising Data Flags of the remote device.
+
+		dict AdvertisingData [readonly, experimental]
+
+			The Advertising Data of the remote device. Keys are
+			are 8 bits AD Type followed by data as byte array.
+
+			Note: Only types considered safe to be handled by
+			application are exposed.
+
+			Possible values:
+				<type> <byte array>
+				...
+
+			Example:
+				<Transport Discovery> <Organization Flags...>
+				0x26                   0x01         0x01...

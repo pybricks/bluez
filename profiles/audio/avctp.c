@@ -39,17 +39,16 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 
-#include <bluetooth/bluetooth.h>
-#include <bluetooth/sdp.h>
-#include <bluetooth/l2cap.h>
-
 #include <glib.h>
 
-#include "btio/btio.h"
+#include "lib/bluetooth.h"
+#include "lib/sdp.h"
+#include "lib/l2cap.h"
 #include "lib/uuid.h"
+
+#include "btio/btio.h"
 #include "src/adapter.h"
 #include "src/device.h"
-
 #include "src/log.h"
 #include "src/error.h"
 #include "src/uinput.h"
@@ -61,6 +60,12 @@
  * command with the pressed value is valid for two seconds
  */
 #define AVC_PRESS_TIMEOUT	2
+
+#define CONTROL_TIMEOUT		10
+#define BROWSING_TIMEOUT	10
+
+#define PASSTHROUGH_QUEUE	0
+#define CONTROL_QUEUE		1
 
 #define QUIRK_NO_RELEASE 1 << 0
 
@@ -152,13 +157,21 @@ struct avctp_browsing_req {
 typedef int (*avctp_process_cb) (void *data);
 
 struct avctp_pending_req {
-	struct avctp_channel *chan;
+	struct avctp_queue *queue;
 	uint8_t transaction;
 	guint timeout;
+	bool retry;
 	int err;
 	avctp_process_cb process;
 	void *data;
 	GDestroyNotify destroy;
+};
+
+struct avctp_queue {
+	struct avctp_channel *chan;
+	struct avctp_pending_req *p;
+	GQueue *queue;
+	guint process_id;
 };
 
 struct avctp_channel {
@@ -170,15 +183,13 @@ struct avctp_channel {
 	uint16_t omtu;
 	uint8_t *buffer;
 	GSList *handlers;
-	struct avctp_pending_req *p;
-	GQueue *queue;
+	GSList *queues;
 	GSList *processed;
-	guint process_id;
 	GDestroyNotify destroy;
 };
 
 struct key_pressed {
-	uint8_t op;
+	uint16_t op;
 	guint timer;
 };
 
@@ -294,8 +305,9 @@ static GSList *servers = NULL;
 static void auth_cb(DBusError *derr, void *user_data);
 static gboolean process_queue(gpointer user_data);
 static gboolean avctp_passthrough_rsp(struct avctp *session, uint8_t code,
-					uint8_t subunit, uint8_t *operands,
-					size_t operand_count, void *user_data);
+					uint8_t subunit, uint8_t transaction,
+					uint8_t *operands, size_t operand_count,
+					void *user_data);
 
 static int send_event(int fd, uint16_t type, uint16_t code, int32_t value)
 {
@@ -329,6 +341,37 @@ static gboolean auto_release(gpointer user_data)
 	send_key(session->uinput, session->key.op, 0);
 
 	return FALSE;
+}
+
+static void handle_press(struct avctp *session, uint16_t op)
+{
+	if (session->key.timer > 0) {
+		g_source_remove(session->key.timer);
+
+		/* Only auto release if keys are different */
+		if (session->key.op == op)
+			goto done;
+
+		send_key(session->uinput, session->key.op, 0);
+	}
+
+	session->key.op = op;
+
+	send_key(session->uinput, op, 1);
+
+done:
+	session->key.timer = g_timeout_add_seconds(AVC_PRESS_TIMEOUT,
+							auto_release, session);
+}
+
+static void handle_release(struct avctp *session, uint16_t op)
+{
+	if (session->key.timer > 0) {
+		g_source_remove(session->key.timer);
+		session->key.timer = 0;
+	}
+
+	send_key(session->uinput, op, 0);
 }
 
 static size_t handle_panel_passthrough(struct avctp *session,
@@ -384,23 +427,11 @@ static size_t handle_panel_passthrough(struct avctp *session,
 			break;
 		}
 
-		if (pressed) {
-			if (session->key.timer > 0) {
-				g_source_remove(session->key.timer);
-				send_key(session->uinput, session->key.op, 0);
-			}
+		if (pressed)
+			handle_press(session, key_map[i].uinput);
+		else
+			handle_release(session, key_map[i].uinput);
 
-			session->key.op = key_map[i].uinput;
-			session->key.timer = g_timeout_add_seconds(
-							AVC_PRESS_TIMEOUT,
-							auto_release,
-							session);
-		} else if (session->key.timer > 0) {
-			g_source_remove(session->key.timer);
-			session->key.timer = 0;
-		}
-
-		send_key(session->uinput, key_map[i].uinput, pressed);
 		break;
 	}
 
@@ -491,6 +522,21 @@ static void pending_destroy(gpointer data, gpointer user_data)
 	g_free(req);
 }
 
+static void avctp_queue_destroy(void *data)
+{
+	struct avctp_queue *queue = data;
+
+	if (queue->process_id > 0)
+		g_source_remove(queue->process_id);
+
+	if (queue->p)
+		pending_destroy(queue->p, NULL);
+
+	g_queue_foreach(queue->queue, pending_destroy, NULL);
+	g_queue_free(queue->queue);
+	g_free(queue);
+}
+
 static void avctp_channel_destroy(struct avctp_channel *chan)
 {
 	g_io_channel_shutdown(chan->io, TRUE, NULL);
@@ -499,20 +545,13 @@ static void avctp_channel_destroy(struct avctp_channel *chan)
 	if (chan->watch)
 		g_source_remove(chan->watch);
 
-	if (chan->p)
-		pending_destroy(chan->p, NULL);
-
-	if (chan->process_id > 0)
-		g_source_remove(chan->process_id);
-
 	if (chan->destroy)
 		chan->destroy(chan);
 
 	g_free(chan->buffer);
-	g_queue_foreach(chan->queue, pending_destroy, NULL);
-	g_queue_free(chan->queue);
 	g_slist_foreach(chan->processed, pending_destroy, NULL);
 	g_slist_free(chan->processed);
+	g_slist_free_full(chan->queues, avctp_queue_destroy);
 	g_slist_free_full(chan->handlers, g_free);
 	g_free(chan);
 }
@@ -555,7 +594,8 @@ static void avctp_disconnected(struct avctp *session)
 	g_free(session);
 }
 
-static void avctp_set_state(struct avctp *session, avctp_state_t new_state)
+static void avctp_set_state(struct avctp *session, avctp_state_t new_state,
+									int err)
 {
 	GSList *l;
 	avctp_state_t old_state = session->state;
@@ -568,7 +608,8 @@ static void avctp_set_state(struct avctp *session, avctp_state_t new_state)
 		if (cb->dev && cb->dev != session->device)
 			continue;
 
-		cb->cb(session->device, old_state, new_state, cb->user_data);
+		cb->cb(session->device, old_state, new_state, err,
+								cb->user_data);
 	}
 
 	switch (new_state) {
@@ -592,6 +633,39 @@ static void avctp_set_state(struct avctp *session, avctp_state_t new_state)
 		error("Invalid AVCTP state %d", new_state);
 		return;
 	}
+}
+
+static uint8_t chan_get_transaction(struct avctp_channel *chan)
+{
+	GSList *l, *tmp;
+	uint8_t transaction;
+
+	if (!chan->processed)
+		goto done;
+
+	tmp = g_slist_copy(chan->processed);
+
+	/* Find first unused transaction id */
+	for (l = tmp; l; l = g_slist_next(l)) {
+		struct avctp_pending_req *req = l->data;
+
+		if (req->transaction == chan->transaction) {
+			chan->transaction++;
+			chan->transaction %= 16;
+			tmp = g_slist_delete_link(tmp, l);
+			l = tmp;
+		}
+	}
+
+	g_slist_free(tmp);
+
+done:
+	transaction = chan->transaction;
+
+	chan->transaction++;
+	chan->transaction %= 16;
+
+	return transaction;
 }
 
 static int avctp_send(struct avctp_channel *control, uint8_t transaction,
@@ -620,6 +694,9 @@ static int avctp_send(struct avctp_channel *control, uint8_t transaction,
 	avctp = (void *) control->buffer;
 	avc = (void *) avctp + sizeof(*avctp);
 
+	if (transaction > 16)
+		transaction = chan_get_transaction(control);
+
 	avctp->transaction = transaction;
 	avctp->packet_type = AVCTP_PACKET_SINGLE;
 	avctp->cr = cr;
@@ -639,10 +716,11 @@ static int avctp_send(struct avctp_channel *control, uint8_t transaction,
 	return err;
 }
 
-static int avctp_browsing_send(struct avctp_channel *browsing,
+static int avctp_browsing_send(struct avctp_queue *queue,
 				uint8_t transaction, uint8_t cr,
 				uint8_t *operands, size_t operand_count)
 {
+	struct avctp_channel *browsing = queue->chan;
 	struct avctp_header *avctp;
 	struct msghdr msg;
 	struct iovec iov[2];
@@ -681,13 +759,13 @@ static void control_req_destroy(void *data)
 {
 	struct avctp_control_req *req = data;
 	struct avctp_pending_req *p = req->p;
-	struct avctp *session = p->chan->session;
+	struct avctp *session = p->queue->chan->session;
 
 	if (p->err == 0 || req->func == NULL)
 		goto done;
 
-	req->func(session, AVC_CTYPE_REJECTED, req->subunit, NULL, 0,
-							req->user_data);
+	req->func(session, AVC_CTYPE_REJECTED, req->subunit, p->transaction,
+						NULL, 0, req->user_data);
 
 done:
 	g_free(req->operands);
@@ -698,7 +776,7 @@ static void browsing_req_destroy(void *data)
 {
 	struct avctp_browsing_req *req = data;
 	struct avctp_pending_req *p = req->p;
-	struct avctp *session = p->chan->session;
+	struct avctp *session = p->queue->chan->session;
 
 	if (p->err == 0 || req->func == NULL)
 		goto done;
@@ -712,53 +790,96 @@ done:
 
 static gboolean req_timeout(gpointer user_data)
 {
-	struct avctp_channel *chan = user_data;
-	struct avctp_pending_req *p = chan->p;
+	struct avctp_queue *queue = user_data;
+	struct avctp_pending_req *p = queue->p;
 
-	DBG("transaction %u", p->transaction);
+	DBG("transaction %u retry %s", p->transaction, p->retry ? "true" :
+								"false");
 
 	p->timeout = 0;
+
+	if (p->retry) {
+		p->process(p->data);
+		return FALSE;
+	}
+
 	p->err = -ETIMEDOUT;
 
 	pending_destroy(p, NULL);
-	chan->p = NULL;
+	queue->p = NULL;
 
-	if (chan->process_id == 0)
-		chan->process_id = g_idle_add(process_queue, chan);
+	if (queue->process_id == 0)
+		queue->process_id = g_idle_add(process_queue, queue);
 
 	return FALSE;
+}
+
+static int process_passthrough(void *data)
+{
+	struct avctp_control_req *req = data;
+	struct avctp_pending_req *p = req->p;
+	int ret;
+
+	ret = avctp_send(p->queue->chan, p->transaction, AVCTP_COMMAND,
+			req->code, req->subunit, req->op, req->operands,
+			req->operand_count);
+	if (ret < 0)
+		return ret;
+
+	p->timeout = g_timeout_add_seconds(AVC_PRESS_TIMEOUT, req_timeout,
+								p->queue);
+
+	return 0;
 }
 
 static int process_control(void *data)
 {
 	struct avctp_control_req *req = data;
 	struct avctp_pending_req *p = req->p;
+	int ret;
 
-	return avctp_send(p->chan, p->transaction, AVCTP_COMMAND, req->code,
-					req->subunit, req->op,
-					req->operands, req->operand_count);
+	ret = avctp_send(p->queue->chan, p->transaction, AVCTP_COMMAND,
+			req->code, req->subunit, req->op, req->operands,
+			req->operand_count);
+	if (ret < 0)
+		return ret;
+
+	p->retry = !p->retry;
+
+	p->timeout = g_timeout_add_seconds(CONTROL_TIMEOUT, req_timeout,
+								p->queue);
+
+	return 0;
 }
 
 static int process_browsing(void *data)
 {
 	struct avctp_browsing_req *req = data;
 	struct avctp_pending_req *p = req->p;
+	int ret;
 
-	return avctp_browsing_send(p->chan, p->transaction, AVCTP_COMMAND,
+	ret = avctp_browsing_send(p->queue, p->transaction, AVCTP_COMMAND,
 					req->operands, req->operand_count);
+	if (ret < 0)
+		return ret;
+
+	p->timeout = g_timeout_add_seconds(BROWSING_TIMEOUT, req_timeout,
+								p->queue);
+
+	return 0;
 }
 
 static gboolean process_queue(void *user_data)
 {
-	struct avctp_channel *chan = user_data;
-	struct avctp_pending_req *p = chan->p;
+	struct avctp_queue *queue = user_data;
+	struct avctp_pending_req *p = queue->p;
 
-	chan->process_id = 0;
+	queue->process_id = 0;
 
 	if (p != NULL)
 		return FALSE;
 
-	while ((p = g_queue_pop_head(chan->queue))) {
+	while ((p = g_queue_pop_head(queue->queue))) {
 
 		if (p->process(p->data) == 0)
 			break;
@@ -769,8 +890,7 @@ static gboolean process_queue(void *user_data)
 	if (p == NULL)
 		return FALSE;
 
-	chan->p = p;
-	p->timeout = g_timeout_add_seconds(2, req_timeout, chan);
+	queue->p = p;
 
 	return FALSE;
 
@@ -782,11 +902,23 @@ static void control_response(struct avctp_channel *control,
 					uint8_t *operands,
 					size_t operand_count)
 {
-	struct avctp_pending_req *p = control->p;
+	struct avctp_pending_req *p;
 	struct avctp_control_req *req;
+	struct avctp_queue *queue;
 	GSList *l;
 
+	if (avc->opcode == AVC_OP_PASSTHROUGH)
+		queue = g_slist_nth_data(control->queues, PASSTHROUGH_QUEUE);
+	else
+		queue = g_slist_nth_data(control->queues, CONTROL_QUEUE);
+
+	p = queue->p;
+
 	if (p && p->transaction == avctp->transaction) {
+		req = p->data;
+		if (req->op != avc->opcode)
+			goto done;
+
 		control->processed = g_slist_prepend(control->processed, p);
 
 		if (p->timeout > 0) {
@@ -794,13 +926,13 @@ static void control_response(struct avctp_channel *control,
 			p->timeout = 0;
 		}
 
-		control->p = NULL;
+		queue->p = NULL;
 
-		if (control->process_id == 0)
-			control->process_id = g_idle_add(process_queue,
-								control);
+		if (queue->process_id == 0)
+			queue->process_id = g_idle_add(process_queue, queue);
 	}
 
+done:
 	for (l = control->processed; l; l = l->next) {
 		p = l->data;
 		req = p->data;
@@ -808,10 +940,13 @@ static void control_response(struct avctp_channel *control,
 		if (p->transaction != avctp->transaction)
 			continue;
 
+		if (req->op != avc->opcode)
+			continue;
+
 		if (req->func && req->func(control->session, avc->code,
-						avc->subunit_type,
-						operands, operand_count,
-						req->user_data))
+					avc->subunit_type, p->transaction,
+					operands, operand_count,
+					req->user_data))
 			return;
 
 		control->processed = g_slist_remove(control->processed, p);
@@ -826,9 +961,14 @@ static void browsing_response(struct avctp_channel *browsing,
 					uint8_t *operands,
 					size_t operand_count)
 {
-	struct avctp_pending_req *p = browsing->p;
+	struct avctp_pending_req *p;
 	struct avctp_browsing_req *req;
+	struct avctp_queue *queue;
 	GSList *l;
+
+	queue = g_slist_nth_data(browsing->queues, 0);
+
+	p = queue->p;
 
 	if (p && p->transaction == avctp->transaction) {
 		browsing->processed = g_slist_prepend(browsing->processed, p);
@@ -838,11 +978,10 @@ static void browsing_response(struct avctp_channel *browsing,
 			p->timeout = 0;
 		}
 
-		browsing->p = NULL;
+		queue->p = NULL;
 
-		if (browsing->process_id == 0)
-			browsing->process_id = g_idle_add(process_queue,
-								browsing);
+		if (queue->process_id == 0)
+			queue->process_id = g_idle_add(process_queue, queue);
 	}
 
 	for (l = browsing->processed; l; l = l->next) {
@@ -922,7 +1061,7 @@ send:
 
 failed:
 	DBG("AVCTP Browsing: disconnected");
-	avctp_set_state(session, AVCTP_STATE_CONNECTED);
+	avctp_set_state(session, AVCTP_STATE_CONNECTED, 0);
 
 	if (session->browsing) {
 		avctp_channel_destroy(session->browsing);
@@ -1018,7 +1157,7 @@ done:
 
 failed:
 	DBG("AVCTP session %p got disconnected", session);
-	avctp_set_state(session, AVCTP_STATE_DISCONNECTED);
+	avctp_set_state(session, AVCTP_STATE_DISCONNECTED, -EIO);
 	return FALSE;
 }
 
@@ -1074,6 +1213,8 @@ static int uinput_create(char *name)
 		return err;
 	}
 
+	send_event(fd, EV_REP, REP_DELAY, 300);
+
 	return fd;
 }
 
@@ -1097,8 +1238,20 @@ static void init_uinput(struct avctp *session)
 		DBG("AVRCP: uinput initialized for %s", address);
 }
 
+static struct avctp_queue *avctp_queue_create(struct avctp_channel *chan)
+{
+	struct avctp_queue *queue;
+
+	queue = g_new0(struct avctp_queue, 1);
+	queue->chan = chan;
+	queue->queue = g_queue_new();
+
+	return queue;
+}
+
 static struct avctp_channel *avctp_channel_create(struct avctp *session,
 							GIOChannel *io,
+							int queues,
 							GDestroyNotify destroy)
 {
 	struct avctp_channel *chan;
@@ -1106,8 +1259,14 @@ static struct avctp_channel *avctp_channel_create(struct avctp *session,
 	chan = g_new0(struct avctp_channel, 1);
 	chan->session = session;
 	chan->io = g_io_channel_ref(io);
-	chan->queue = g_queue_new();
 	chan->destroy = destroy;
+
+	while (queues--) {
+		struct avctp_queue *queue;
+
+		queue = avctp_queue_create(chan);
+		chan->queues = g_slist_prepend(chan->queues, queue);
+	}
 
 	return chan;
 }
@@ -1136,6 +1295,7 @@ static void avctp_connect_browsing_cb(GIOChannel *chan, GError *err,
 {
 	struct avctp *session = data;
 	struct avctp_channel *browsing = session->browsing;
+	struct avctp_queue *queue;
 	char address[18];
 	uint16_t imtu, omtu;
 	GError *gerr = NULL;
@@ -1161,7 +1321,7 @@ static void avctp_connect_browsing_cb(GIOChannel *chan, GError *err,
 	DBG("AVCTP Browsing: connected to %s", address);
 
 	if (browsing == NULL) {
-		browsing = avctp_channel_create(session, chan,
+		browsing = avctp_channel_create(session, chan, 1,
 						avctp_destroy_browsing);
 		session->browsing = browsing;
 	}
@@ -1173,16 +1333,17 @@ static void avctp_connect_browsing_cb(GIOChannel *chan, GError *err,
 				G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL,
 				(GIOFunc) session_browsing_cb, session);
 
-	avctp_set_state(session, AVCTP_STATE_BROWSING_CONNECTED);
+	avctp_set_state(session, AVCTP_STATE_BROWSING_CONNECTED, 0);
 
 	/* Process any request that was pending the connection to complete */
-	if (browsing->process_id == 0 && !g_queue_is_empty(browsing->queue))
-		browsing->process_id = g_idle_add(process_queue, browsing);
+	queue = g_slist_nth_data(browsing->queues, 0);
+	if (queue->process_id == 0 && !g_queue_is_empty(queue->queue))
+		queue->process_id = g_idle_add(process_queue, queue);
 
 	return;
 
 fail:
-	avctp_set_state(session, AVCTP_STATE_CONNECTED);
+	avctp_set_state(session, AVCTP_STATE_CONNECTED, 0);
 
 	if (session->browsing) {
 		avctp_channel_destroy(session->browsing);
@@ -1198,7 +1359,7 @@ static void avctp_connect_cb(GIOChannel *chan, GError *err, gpointer data)
 	GError *gerr = NULL;
 
 	if (err) {
-		avctp_set_state(session, AVCTP_STATE_DISCONNECTED);
+		avctp_set_state(session, AVCTP_STATE_DISCONNECTED, -EIO);
 		error("%s", err->message);
 		return;
 	}
@@ -1209,7 +1370,7 @@ static void avctp_connect_cb(GIOChannel *chan, GError *err, gpointer data)
 			BT_IO_OPT_IMTU, &omtu,
 			BT_IO_OPT_INVALID);
 	if (gerr) {
-		avctp_set_state(session, AVCTP_STATE_DISCONNECTED);
+		avctp_set_state(session, AVCTP_STATE_DISCONNECTED, -EIO);
 		error("%s", gerr->message);
 		g_error_free(gerr);
 		return;
@@ -1218,7 +1379,7 @@ static void avctp_connect_cb(GIOChannel *chan, GError *err, gpointer data)
 	DBG("AVCTP: connected to %s", address);
 
 	if (session->control == NULL)
-		session->control = avctp_channel_create(session, chan, NULL);
+		session->control = avctp_channel_create(session, chan, 2, NULL);
 
 	session->control->imtu = imtu;
 	session->control->omtu = omtu;
@@ -1242,7 +1403,7 @@ static void avctp_connect_cb(GIOChannel *chan, GError *err, gpointer data)
 
 	init_uinput(session);
 
-	avctp_set_state(session, AVCTP_STATE_CONNECTED);
+	avctp_set_state(session, AVCTP_STATE_CONNECTED, 0);
 }
 
 static void auth_cb(DBusError *derr, void *user_data)
@@ -1259,7 +1420,7 @@ static void auth_cb(DBusError *derr, void *user_data)
 
 	if (derr && dbus_error_is_set(derr)) {
 		error("Access denied: %s", derr->message);
-		avctp_set_state(session, AVCTP_STATE_DISCONNECTED);
+		avctp_set_state(session, AVCTP_STATE_DISCONNECTED, -EIO);
 		return;
 	}
 
@@ -1267,7 +1428,7 @@ static void auth_cb(DBusError *derr, void *user_data)
 								NULL, &err)) {
 		error("bt_io_accept: %s", err->message);
 		g_error_free(err);
-		avctp_set_state(session, AVCTP_STATE_DISCONNECTED);
+		avctp_set_state(session, AVCTP_STATE_DISCONNECTED, -EIO);
 	}
 }
 
@@ -1329,11 +1490,18 @@ static void avctp_control_confirm(struct avctp *session, GIOChannel *chan,
 	if (session->control != NULL) {
 		error("Control: Refusing unexpected connect");
 		g_io_channel_shutdown(chan, TRUE, NULL);
+
+		/*
+		 * Close AVCTP channel if remote tried connect
+		 * at the same time
+		 * AVRCP SPEC V1.5 4.1.1 Connection Establishment
+		 */
+		avctp_set_state(session, AVCTP_STATE_DISCONNECTED, -EAGAIN);
 		return;
 	}
 
-	avctp_set_state(session, AVCTP_STATE_CONNECTING);
-	session->control = avctp_channel_create(session, chan, NULL);
+	avctp_set_state(session, AVCTP_STATE_CONNECTING, 0);
+	session->control = avctp_channel_create(session, chan, 2, NULL);
 
 	src = btd_adapter_get_address(device_get_adapter(dev));
 	dst = device_get_address(dev);
@@ -1349,7 +1517,7 @@ static void avctp_control_confirm(struct avctp *session, GIOChannel *chan,
 	return;
 
 drop:
-	avctp_set_state(session, AVCTP_STATE_DISCONNECTED);
+	avctp_set_state(session, AVCTP_STATE_DISCONNECTED, -EIO);
 }
 
 static void avctp_browsing_confirm(struct avctp *session, GIOChannel *chan,
@@ -1365,7 +1533,7 @@ static void avctp_browsing_confirm(struct avctp *session, GIOChannel *chan,
 
 	if (bt_io_accept(chan, avctp_connect_browsing_cb, session, NULL,
 								&err)) {
-		avctp_set_state(session, AVCTP_STATE_BROWSING_CONNECTING);
+		avctp_set_state(session, AVCTP_STATE_BROWSING_CONNECTING, 0);
 		return;
 	}
 
@@ -1503,43 +1671,19 @@ void avctp_unregister(struct btd_adapter *adapter)
 	g_free(server);
 }
 
-static struct avctp_pending_req *pending_create(struct avctp_channel *chan,
+static struct avctp_pending_req *pending_create(struct avctp_queue *queue,
 						avctp_process_cb process,
 						void *data,
 						GDestroyNotify destroy)
 {
 	struct avctp_pending_req *p;
-	GSList *l, *tmp;
 
-	if (!chan->processed)
-		goto done;
-
-	tmp = g_slist_copy(chan->processed);
-
-	/* Find first unused transaction id */
-	for (l = tmp; l; l = g_slist_next(l)) {
-		struct avctp_pending_req *req = l->data;
-
-		if (req->transaction == chan->transaction) {
-			chan->transaction++;
-			chan->transaction %= 16;
-			tmp = g_slist_delete_link(tmp, l);
-			l = tmp;
-		}
-	}
-
-	g_slist_free(tmp);
-
-done:
 	p = g_new0(struct avctp_pending_req, 1);
-	p->chan = chan;
-	p->transaction = chan->transaction;
+	p->queue = queue;
+	p->transaction = chan_get_transaction(queue->chan);
 	p->process = process;
 	p->data = data;
 	p->destroy = destroy;
-
-	chan->transaction++;
-	chan->transaction %= 16;
 
 	return p;
 }
@@ -1550,11 +1694,17 @@ static int avctp_send_req(struct avctp *session, uint8_t code,
 				avctp_rsp_cb func, void *user_data)
 {
 	struct avctp_channel *control = session->control;
+	struct avctp_queue *queue;
 	struct avctp_pending_req *p;
 	struct avctp_control_req *req;
 
 	if (control == NULL)
 		return -ENOTCONN;
+
+	/* If the request set a callback send it directly */
+	if (!func)
+		return avctp_send(session->control, -1, AVCTP_COMMAND,
+				code, subunit, opcode, operands, operand_count);
 
 	req = g_new0(struct avctp_control_req, 1);
 	req->code = code;
@@ -1565,14 +1715,22 @@ static int avctp_send_req(struct avctp *session, uint8_t code,
 	req->operand_count = operand_count;
 	req->user_data = user_data;
 
-	p = pending_create(control, process_control, req, control_req_destroy);
+	if (opcode == AVC_OP_PASSTHROUGH) {
+		queue = g_slist_nth_data(control->queues, PASSTHROUGH_QUEUE);
+		p = pending_create(queue, process_passthrough, req,
+					control_req_destroy);
+	} else {
+		queue = g_slist_nth_data(control->queues, CONTROL_QUEUE);
+		p = pending_create(queue, process_control, req,
+					control_req_destroy);
+	}
 
 	req->p = p;
 
-	g_queue_push_tail(control->queue, p);
+	g_queue_push_tail(queue->queue, p);
 
-	if (control->process_id == 0)
-		control->process_id = g_idle_add(process_queue, control);
+	if (queue->process_id == 0)
+		queue->process_id = g_idle_add(process_queue, queue);
 
 	return 0;
 }
@@ -1582,6 +1740,7 @@ int avctp_send_browsing_req(struct avctp *session,
 				avctp_browsing_rsp_cb func, void *user_data)
 {
 	struct avctp_channel *browsing = session->browsing;
+	struct avctp_queue *queue;
 	struct avctp_pending_req *p;
 	struct avctp_browsing_req *req;
 
@@ -1594,19 +1753,20 @@ int avctp_send_browsing_req(struct avctp *session,
 	req->operand_count = operand_count;
 	req->user_data = user_data;
 
-	p = pending_create(browsing, process_browsing, req,
-			browsing_req_destroy);
+	queue = g_slist_nth_data(browsing->queues, 0);
+
+	p = pending_create(queue, process_browsing, req, browsing_req_destroy);
 
 	req->p = p;
 
-	g_queue_push_tail(browsing->queue, p);
+	g_queue_push_tail(queue->queue, p);
 
 	/* Connection did not complete, delay process of the request */
 	if (browsing->watch == 0)
 		return 0;
 
-	if (browsing->process_id == 0)
-		browsing->process_id = g_idle_add(process_queue, browsing);
+	if (queue->process_id == 0)
+		queue->process_id = g_idle_add(process_queue, queue);
 
 	return 0;
 }
@@ -1695,8 +1855,9 @@ static bool set_pressed(struct avctp *session, uint8_t op)
 }
 
 static gboolean avctp_passthrough_rsp(struct avctp *session, uint8_t code,
-					uint8_t subunit, uint8_t *operands,
-					size_t operand_count, void *user_data)
+					uint8_t subunit, uint8_t transaction,
+					uint8_t *operands, size_t operand_count,
+					void *user_data)
 {
 	if (code != AVC_CTYPE_ACCEPTED)
 		return FALSE;
@@ -1955,7 +2116,7 @@ struct avctp *avctp_connect(struct btd_device *device)
 	if (session->state > AVCTP_STATE_DISCONNECTED)
 		return session;
 
-	avctp_set_state(session, AVCTP_STATE_CONNECTING);
+	avctp_set_state(session, AVCTP_STATE_CONNECTING, 0);
 
 	src = btd_adapter_get_address(session->server->adapter);
 
@@ -1967,13 +2128,13 @@ struct avctp *avctp_connect(struct btd_device *device)
 				BT_IO_OPT_PSM, AVCTP_CONTROL_PSM,
 				BT_IO_OPT_INVALID);
 	if (err) {
-		avctp_set_state(session, AVCTP_STATE_DISCONNECTED);
+		avctp_set_state(session, AVCTP_STATE_DISCONNECTED, -EIO);
 		error("%s", err->message);
 		g_error_free(err);
 		return NULL;
 	}
 
-	session->control = avctp_channel_create(session, io, NULL);
+	session->control = avctp_channel_create(session, io, 2, NULL);
 	session->initiator = true;
 	g_io_channel_unref(io);
 
@@ -1992,7 +2153,7 @@ int avctp_connect_browsing(struct avctp *session)
 	if (session->browsing != NULL)
 		return 0;
 
-	avctp_set_state(session, AVCTP_STATE_BROWSING_CONNECTING);
+	avctp_set_state(session, AVCTP_STATE_BROWSING_CONNECTING, 0);
 
 	src = btd_adapter_get_address(session->server->adapter);
 
@@ -2010,7 +2171,7 @@ int avctp_connect_browsing(struct avctp *session)
 		return -EIO;
 	}
 
-	session->browsing = avctp_channel_create(session, io,
+	session->browsing = avctp_channel_create(session, io, 1,
 						avctp_destroy_browsing);
 	g_io_channel_unref(io);
 
@@ -2022,7 +2183,7 @@ void avctp_disconnect(struct avctp *session)
 	if (session->state == AVCTP_STATE_DISCONNECTED)
 		return;
 
-	avctp_set_state(session, AVCTP_STATE_DISCONNECTED);
+	avctp_set_state(session, AVCTP_STATE_DISCONNECTED, -EIO);
 }
 
 struct avctp *avctp_get(struct btd_device *device)

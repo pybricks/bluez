@@ -36,7 +36,7 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 
-#include <gobex/gobex.h>
+#include "gobex/gobex.h"
 #include "btio/btio.h"
 
 static GMainLoop *main_loop = NULL;
@@ -242,7 +242,8 @@ static void parse_line(char *line_read)
 		return;
 	}
 
-	add_history(line_read);
+	if (history_search(line_read, -1))
+		add_history(line_read);
 
 	g_shell_parse_argv(line_read, &argcp, &argvp, NULL);
 
@@ -432,6 +433,7 @@ int main(int argc, char *argv[])
 	if (err != NULL) {
 		g_printerr("%s\n", err->message);
 		g_error_free(err);
+		g_option_context_free(context);
 		exit(EXIT_FAILURE);
 	}
 
@@ -445,8 +447,10 @@ int main(int argc, char *argv[])
 	else
 		io = unix_connect(transport);
 
-	if (io == NULL)
+	if (io == NULL) {
+		g_option_context_free(context);
 		exit(EXIT_FAILURE);
+	}
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = sig_term;

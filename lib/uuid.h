@@ -30,7 +30,6 @@ extern "C" {
 #endif
 
 #include <stdint.h>
-#include <bluetooth/bluetooth.h>
 
 #define GENERIC_AUDIO_UUID	"00001203-0000-1000-8000-00805f9b34fb"
 
@@ -120,6 +119,7 @@ extern "C" {
 #define GATT_CHARAC_RECONNECTION_ADDRESS		0x2A03
 #define GATT_CHARAC_PERIPHERAL_PREF_CONN		0x2A04
 #define GATT_CHARAC_SERVICE_CHANGED			0x2A05
+#define GATT_CHARAC_BATTERY_LEVEL			0x2A19
 #define GATT_CHARAC_SYSTEM_ID				0x2A23
 #define GATT_CHARAC_MODEL_NUMBER_STRING			0x2A24
 #define GATT_CHARAC_SERIAL_NUMBER_STRING		0x2A25
@@ -127,6 +127,7 @@ extern "C" {
 #define GATT_CHARAC_HARDWARE_REVISION_STRING		0x2A27
 #define GATT_CHARAC_SOFTWARE_REVISION_STRING		0x2A28
 #define GATT_CHARAC_MANUFACTURER_NAME_STRING		0x2A29
+#define GATT_CHARAC_PNP_ID				0x2A50
 
 /* GATT Characteristic Descriptors */
 #define GATT_CHARAC_EXT_PROPER_UUID			0x2900
@@ -138,6 +139,16 @@ extern "C" {
 #define GATT_CHARAC_VALID_RANGE_UUID			0x2906
 #define GATT_EXTERNAL_REPORT_REFERENCE			0x2907
 #define GATT_REPORT_REFERENCE				0x2908
+
+/* GATT Mesh Services */
+#define MESH_PROV_SVC_UUID	"00001827-0000-1000-8000-00805f9b34fb"
+#define MESH_PROXY_SVC_UUID	"00001828-0000-1000-8000-00805f9b34fb"
+
+/* GATT Mesh Characteristic Types */
+#define MESH_PROVISIONING_DATA_IN			0x2ADB
+#define MESH_PROVISIONING_DATA_OUT			0x2ADC
+#define MESH_PROXY_DATA_IN				0x2ADD
+#define MESH_PROXY_DATA_OUT				0x2ADE
 
 typedef struct {
 	enum {
@@ -166,6 +177,8 @@ void bt_uuid_to_uuid128(const bt_uuid_t *src, bt_uuid_t *dst);
 
 int bt_uuid_to_string(const bt_uuid_t *uuid, char *str, size_t n);
 int bt_string_to_uuid(bt_uuid_t *uuid, const char *string);
+
+int bt_uuid_to_le(const bt_uuid_t *uuid, void *dst);
 
 static inline int bt_uuid_len(const bt_uuid_t *uuid)
 {

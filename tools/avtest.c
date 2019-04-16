@@ -35,11 +35,11 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-#include <bluetooth/bluetooth.h>
-#include <bluetooth/hci.h>
-#include <bluetooth/hci_lib.h>
-#include <bluetooth/l2cap.h>
-#include <bluetooth/sdp.h>
+#include "lib/bluetooth.h"
+#include "lib/hci.h"
+#include "lib/hci_lib.h"
+#include "lib/l2cap.h"
+#include "lib/sdp.h"
 
 #define AVDTP_PKT_TYPE_SINGLE		0x00
 #define AVDTP_PKT_TYPE_START		0x01
@@ -799,7 +799,7 @@ int main(int argc, char *argv[])
 
 		case 'f':
 			invalid = 1;
-			/* Intentionally missing break */
+			/* fall through */
 
 		case 's':
 			mode = MODE_SEND;

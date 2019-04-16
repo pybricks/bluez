@@ -34,18 +34,20 @@
 #include <sys/socket.h>
 
 #include <glib.h>
-#include <gdbus/gdbus.h>
 
-#include "btio/btio.h"
+#include "lib/bluetooth.h"
 #include "lib/uuid.h"
 
-#include "obexd.h"
-#include "plugin.h"
-#include "server.h"
-#include "obex.h"
-#include "transport.h"
-#include "service.h"
-#include "log.h"
+#include "gdbus/gdbus.h"
+
+#include "btio/btio.h"
+#include "obexd/src/obexd.h"
+#include "obexd/src/plugin.h"
+#include "obexd/src/server.h"
+#include "obexd/src/obex.h"
+#include "obexd/src/transport.h"
+#include "obexd/src/service.h"
+#include "obexd/src/log.h"
 
 #define BT_RX_MTU 32767
 #define BT_TX_MTU 32767
@@ -73,8 +75,8 @@ static void connect_event(GIOChannel *io, GError *err, void *user_data)
 	struct bluetooth_profile *profile = user_data;
 	struct obex_server *server = profile->server;
 	int type;
-	int omtu = BT_TX_MTU;
-	int imtu = BT_RX_MTU;
+	uint16_t omtu = BT_TX_MTU;
+	uint16_t imtu = BT_RX_MTU;
 	gboolean stream = TRUE;
 	socklen_t len = sizeof(int);
 
@@ -142,12 +144,15 @@ static DBusMessage *profile_new_connection(DBusConnection *conn,
 	if (fcntl(fd, F_GETFD) < 0) {
 		error("bluetooth: fcntl(%d, F_GETFD): %s (%d)", fd,
 						strerror(errno), errno);
+		close(fd);
 		return invalid_args(msg);
 	}
 
 	io = g_io_channel_unix_new(fd);
-	if (io == NULL)
+	if (io == NULL) {
+		close(fd);
 		return invalid_args(msg);
+	}
 
 	DBG("device %s", device);
 
@@ -226,40 +231,6 @@ static void profile_free(void *data)
 	g_free(profile);
 }
 
-static void append_variant(DBusMessageIter *iter, int type, void *val)
-{
-	DBusMessageIter value;
-	char sig[2] = { type, '\0' };
-
-	dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, sig, &value);
-
-	dbus_message_iter_append_basic(&value, type, val);
-
-	dbus_message_iter_close_container(iter, &value);
-}
-
-
-static void dict_append_entry(DBusMessageIter *dict,
-			const char *key, int type, void *val)
-{
-	DBusMessageIter entry;
-
-	if (type == DBUS_TYPE_STRING) {
-		const char *str = *((const char **) val);
-		if (str == NULL)
-			return;
-	}
-
-	dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY,
-							NULL, &entry);
-
-	dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
-
-	append_variant(&entry, type, val);
-
-	dbus_message_iter_close_container(dict, &entry);
-}
-
 static int register_profile(struct bluetooth_profile *profile)
 {
 	DBusMessage *msg;
@@ -298,7 +269,7 @@ static int register_profile(struct bluetooth_profile *profile)
 					DBUS_TYPE_VARIANT_AS_STRING
 					DBUS_DICT_ENTRY_END_CHAR_AS_STRING,
 					&opt);
-	dict_append_entry(&opt, "AutoConnect", DBUS_TYPE_BOOLEAN,
+	g_dbus_dict_append_entry(&opt, "AutoConnect", DBUS_TYPE_BOOLEAN,
 								&auto_connect);
 	if (profile->driver->record) {
 		if (profile->driver->port != 0)
@@ -310,8 +281,8 @@ static int register_profile(struct bluetooth_profile *profile)
 			xml = g_markup_printf_escaped(profile->driver->record,
 						profile->driver->channel,
 						profile->driver->name);
-		dict_append_entry(&opt, "ServiceRecord", DBUS_TYPE_STRING,
-								&xml);
+		g_dbus_dict_append_entry(&opt, "ServiceRecord",
+						DBUS_TYPE_STRING, &xml);
 		g_free(xml);
 	}
 	dbus_message_iter_close_container(&iter, &opt);

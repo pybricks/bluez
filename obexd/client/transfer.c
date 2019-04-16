@@ -36,11 +36,11 @@
 #include <inttypes.h>
 
 #include <glib.h>
-#include <gdbus/gdbus.h>
-#include <gobex/gobex.h>
 
-#include "dbus.h"
-#include "log.h"
+#include "gdbus/gdbus.h"
+#include "gobex/gobex.h"
+
+#include "obexd/src/log.h"
 #include "transfer.h"
 
 #define TRANSFER_INTERFACE "org.bluez.obex.Transfer1"

@@ -30,10 +30,13 @@
 
 #include <errno.h>
 #include <glib.h>
-#include <bluetooth/sdp.h>
-#include <bluetooth/sdp_lib.h>
 
+#include "lib/sdp.h"
+#include "lib/sdp_lib.h"
 #include "lib/uuid.h"
+
+#include "gdbus/gdbus.h"
+
 #include "btio/btio.h"
 #include "src/adapter.h"
 #include "src/sdpd.h"
@@ -41,6 +44,7 @@
 #include "src/error.h"
 #include "src/dbus-common.h"
 #include "src/shared/util.h"
+
 #include "sap.h"
 #include "server.h"
 
@@ -670,8 +674,7 @@ int sap_connect_rsp(void *sap_device, uint8_t status)
 		param->len = htons(SAP_PARAM_ID_MAX_MSG_SIZE_LEN);
 		put_be16(SAP_BUF_SIZE, &param->val);
 		size += PARAMETER_SIZE(SAP_PARAM_ID_MAX_MSG_SIZE_LEN);
-
-		/* fall */
+		/* fall through */
 	default:
 		conn->state = SAP_STATE_DISCONNECTED;
 
@@ -988,7 +991,7 @@ int sap_status_ind(void *sap_device, uint8_t status_change)
 
 		/* Change state to connected after ongoing call ended */
 		sap_set_connected(server);
-		/* fall */
+		/* fall through */
 	case SAP_STATE_CONNECTED:
 	case SAP_STATE_GRACEFUL_DISCONNECT:
 		memset(buf, 0, sizeof(buf));

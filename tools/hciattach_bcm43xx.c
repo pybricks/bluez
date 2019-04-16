@@ -36,9 +36,9 @@
 #include <time.h>
 #include <limits.h>
 
-#include <bluetooth/bluetooth.h>
-#include <bluetooth/hci.h>
-#include <bluetooth/hci_lib.h>
+#include "lib/bluetooth.h"
+#include "lib/hci.h"
+#include "lib/hci_lib.h"
 
 #include "hciattach.h"
 
@@ -154,40 +154,6 @@ static int bcm43xx_set_bdaddr(int fd, const char *bdaddr)
 	return 0;
 }
 
-static int bcm43xx_set_speed(int fd, uint32_t speed)
-{
-	unsigned char cmd[] =
-		{ HCI_COMMAND_PKT, 0x18, 0xfc, 0x06, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00 };
-	unsigned char resp[CC_MIN_SIZE];
-
-	printf("Set Controller UART speed to %d bit/s\n", speed);
-
-	cmd[6] = (uint8_t) (speed);
-	cmd[7] = (uint8_t) (speed >> 8);
-	cmd[8] = (uint8_t) (speed >> 16);
-	cmd[9] = (uint8_t) (speed >> 24);
-
-	tcflush(fd, TCIOFLUSH);
-
-	if (write(fd, cmd, sizeof(cmd)) != sizeof(cmd)) {
-		fprintf(stderr, "Failed to write update baudrate command\n");
-		return -1;
-	}
-
-	if (read_hci_event(fd, resp, sizeof(resp)) < CC_MIN_SIZE) {
-		fprintf(stderr, "Failed to update baudrate, invalid HCI event\n");
-		return -1;
-	}
-
-	if (resp[4] != cmd[1] || resp[5] != cmd[2] || resp[6] != CMD_SUCCESS) {
-		fprintf(stderr, "Failed to update baudrate, command failure\n");
-		return -1;
-	}
-
-	return 0;
-}
-
 static int bcm43xx_set_clock(int fd, unsigned char clock)
 {
 	unsigned char cmd[] = { HCI_COMMAND_PKT, 0x45, 0xfc, 0x01, 0x00 };
@@ -217,11 +183,53 @@ static int bcm43xx_set_clock(int fd, unsigned char clock)
 	return 0;
 }
 
+static int bcm43xx_set_speed(int fd, struct termios *ti, uint32_t speed)
+{
+	unsigned char cmd[] =
+		{ HCI_COMMAND_PKT, 0x18, 0xfc, 0x06, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00 };
+	unsigned char resp[CC_MIN_SIZE];
+
+	if (speed > 3000000 && bcm43xx_set_clock(fd, BCM43XX_CLOCK_48))
+		return -1;
+
+	printf("Set Controller UART speed to %d bit/s\n", speed);
+
+	cmd[6] = (uint8_t) (speed);
+	cmd[7] = (uint8_t) (speed >> 8);
+	cmd[8] = (uint8_t) (speed >> 16);
+	cmd[9] = (uint8_t) (speed >> 24);
+
+	tcflush(fd, TCIOFLUSH);
+
+	if (write(fd, cmd, sizeof(cmd)) != sizeof(cmd)) {
+		fprintf(stderr, "Failed to write update baudrate command\n");
+		return -1;
+	}
+
+	if (read_hci_event(fd, resp, sizeof(resp)) < CC_MIN_SIZE) {
+		fprintf(stderr, "Failed to update baudrate, invalid HCI event\n");
+		return -1;
+	}
+
+	if (resp[4] != cmd[1] || resp[5] != cmd[2] || resp[6] != CMD_SUCCESS) {
+		fprintf(stderr, "Failed to update baudrate, command failure\n");
+		return -1;
+	}
+
+	if (set_speed(fd, ti, speed) < 0) {
+		perror("Can't set host baud rate");
+		return -1;
+	}
+
+	return 0;
+}
+
 static int bcm43xx_load_firmware(int fd, const char *fw)
 {
 	unsigned char cmd[] = { HCI_COMMAND_PKT, 0x2e, 0xfc, 0x00 };
-	struct timespec tm_mode = { 0, 50000 };
-	struct timespec tm_ready = { 0, 2000000 };
+	struct timespec tm_mode = { 0, 50000000 };
+	struct timespec tm_ready = { 0, 200000000 };
 	unsigned char resp[CC_MIN_SIZE];
 	unsigned char tx_buf[1024];
 	int len, fd_fw, n;
@@ -343,7 +351,8 @@ static int bcm43xx_locate_patch(const char *dir_name,
 	return ret;
 }
 
-int bcm43xx_init(int fd, int speed, struct termios *ti, const char *bdaddr)
+int bcm43xx_init(int fd, int def_speed, int speed, struct termios *ti,
+		const char *bdaddr)
 {
 	char chip_name[20];
 	char fw_path[PATH_MAX];
@@ -359,8 +368,17 @@ int bcm43xx_init(int fd, int speed, struct termios *ti, const char *bdaddr)
 	if (bcm43xx_locate_patch(FIRMWARE_DIR, chip_name, fw_path)) {
 		fprintf(stderr, "Patch not found, continue anyway\n");
 	} else {
+		if (bcm43xx_set_speed(fd, ti, speed))
+			return -1;
+
 		if (bcm43xx_load_firmware(fd, fw_path))
 			return -1;
+
+		/* Controller speed has been reset to def speed */
+		if (set_speed(fd, ti, def_speed) < 0) {
+			perror("Can't set host baud rate");
+			return -1;
+		}
 
 		if (bcm43xx_reset(fd))
 			return -1;
@@ -369,10 +387,7 @@ int bcm43xx_init(int fd, int speed, struct termios *ti, const char *bdaddr)
 	if (bdaddr)
 		bcm43xx_set_bdaddr(fd, bdaddr);
 
-	if (speed > 3000000 && bcm43xx_set_clock(fd, BCM43XX_CLOCK_48))
-		return -1;
-
-	if (bcm43xx_set_speed(fd, speed))
+	if (bcm43xx_set_speed(fd, ti, speed))
 		return -1;
 
 	return 0;

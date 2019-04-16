@@ -30,6 +30,8 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <limits.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
 
@@ -68,10 +70,16 @@ struct btsnoop {
 	int ref_count;
 	int fd;
 	unsigned long flags;
-	uint32_t type;
+	uint32_t format;
 	uint16_t index;
 	bool aborted;
 	bool pklg_format;
+	bool pklg_v2;
+	const char *path;
+	size_t max_size;
+	size_t cur_size;
+	unsigned int max_count;
+	unsigned int cur_count;
 };
 
 struct btsnoop *btsnoop_open(const char *path, unsigned long flags)
@@ -101,19 +109,21 @@ struct btsnoop *btsnoop_open(const char *path, unsigned long flags)
 		if (be32toh(hdr.version) != btsnoop_version)
 			goto failed;
 
-		btsnoop->type = be32toh(hdr.type);
+		btsnoop->format = be32toh(hdr.type);
 		btsnoop->index = 0xffff;
 	} else {
 		if (!(btsnoop->flags & BTSNOOP_FLAG_PKLG_SUPPORT))
 			goto failed;
 
 		/* Check for Apple Packet Logger format */
-		if (hdr.id[0] != 0x00 || hdr.id[1] != 0x00)
+		if (hdr.id[0] != 0x00 ||
+				(hdr.id[1] != 0x00 && hdr.id[1] != 0x01))
 			goto failed;
 
-		btsnoop->type = BTSNOOP_TYPE_MONITOR;
+		btsnoop->format = BTSNOOP_FORMAT_MONITOR;
 		btsnoop->index = 0xffff;
 		btsnoop->pklg_format = true;
+		btsnoop->pklg_v2 = (hdr.id[1] == 0x01);
 
 		/* Apple Packet Logger format has no header */
 		lseek(btsnoop->fd, 0, SEEK_SET);
@@ -128,29 +138,46 @@ failed:
 	return NULL;
 }
 
-struct btsnoop *btsnoop_create(const char *path, uint32_t type)
+struct btsnoop *btsnoop_create(const char *path, size_t max_size,
+					unsigned int max_count, uint32_t format)
 {
 	struct btsnoop *btsnoop;
 	struct btsnoop_hdr hdr;
+	const char *real_path;
+	char tmp[PATH_MAX];
 	ssize_t written;
+
+	if (!max_size && max_count)
+		return NULL;
 
 	btsnoop = calloc(1, sizeof(*btsnoop));
 	if (!btsnoop)
 		return NULL;
 
-	btsnoop->fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+	/* If max file size is specified, always add counter to file path */
+	if (max_size) {
+		snprintf(tmp, PATH_MAX, "%s.0", path);
+		real_path = tmp;
+	} else {
+		real_path = path;
+	}
+
+	btsnoop->fd = open(real_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
 					S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 	if (btsnoop->fd < 0) {
 		free(btsnoop);
 		return NULL;
 	}
 
-	btsnoop->type = type;
+	btsnoop->format = format;
 	btsnoop->index = 0xffff;
+	btsnoop->path = path;
+	btsnoop->max_count = max_count;
+	btsnoop->max_size = max_size;
 
 	memcpy(hdr.id, btsnoop_id, sizeof(btsnoop_id));
 	hdr.version = htobe32(btsnoop_version);
-	hdr.type = htobe32(btsnoop->type);
+	hdr.type = htobe32(btsnoop->format);
 
 	written = write(btsnoop->fd, &hdr, BTSNOOP_HDR_SIZE);
 	if (written < 0) {
@@ -158,6 +185,8 @@ struct btsnoop *btsnoop_create(const char *path, uint32_t type)
 		free(btsnoop);
 		return NULL;
 	}
+
+	btsnoop->cur_size = BTSNOOP_HDR_SIZE;
 
 	return btsnoop_ref(btsnoop);
 }
@@ -186,16 +215,53 @@ void btsnoop_unref(struct btsnoop *btsnoop)
 	free(btsnoop);
 }
 
-uint32_t btsnoop_get_type(struct btsnoop *btsnoop)
+uint32_t btsnoop_get_format(struct btsnoop *btsnoop)
 {
 	if (!btsnoop)
-		return BTSNOOP_TYPE_INVALID;
+		return BTSNOOP_FORMAT_INVALID;
 
-	return btsnoop->type;
+	return btsnoop->format;
+}
+
+static bool btsnoop_rotate(struct btsnoop *btsnoop)
+{
+	struct btsnoop_hdr hdr;
+	char path[PATH_MAX];
+	ssize_t written;
+
+	close(btsnoop->fd);
+
+	/* Check if max number of log files has been reached */
+	if (btsnoop->max_count && btsnoop->cur_count >= btsnoop->max_count) {
+		snprintf(path, PATH_MAX, "%s.%u", btsnoop->path,
+				btsnoop->cur_count - btsnoop->max_count);
+		unlink(path);
+	}
+
+	snprintf(path, PATH_MAX,"%s.%u", btsnoop->path, btsnoop->cur_count);
+	btsnoop->cur_count++;
+
+	btsnoop->fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+					S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+	if (btsnoop->fd < 0)
+		return false;
+
+	memcpy(hdr.id, btsnoop_id, sizeof(btsnoop_id));
+	hdr.version = htobe32(btsnoop_version);
+	hdr.type = htobe32(btsnoop->format);
+
+	written = write(btsnoop->fd, &hdr, BTSNOOP_HDR_SIZE);
+	if (written < 0)
+		return false;
+
+	btsnoop->cur_size = BTSNOOP_HDR_SIZE;
+
+	return true;
 }
 
 bool btsnoop_write(struct btsnoop *btsnoop, struct timeval *tv,
-			uint32_t flags, const void *data, uint16_t size)
+			uint32_t flags, uint32_t drops, const void *data,
+			uint16_t size)
 {
 	struct btsnoop_pkt pkt;
 	uint64_t ts;
@@ -204,23 +270,32 @@ bool btsnoop_write(struct btsnoop *btsnoop, struct timeval *tv,
 	if (!btsnoop || !tv)
 		return false;
 
+	if (btsnoop->max_size && btsnoop->max_size <=
+			btsnoop->cur_size + size + BTSNOOP_PKT_SIZE)
+		if (!btsnoop_rotate(btsnoop))
+			return false;
+
 	ts = (tv->tv_sec - 946684800ll) * 1000000ll + tv->tv_usec;
 
 	pkt.size  = htobe32(size);
 	pkt.len   = htobe32(size);
 	pkt.flags = htobe32(flags);
-	pkt.drops = htobe32(0);
+	pkt.drops = htobe32(drops);
 	pkt.ts    = htobe64(ts + 0x00E03AB44A676000ll);
 
 	written = write(btsnoop->fd, &pkt, BTSNOOP_PKT_SIZE);
 	if (written < 0)
 		return false;
 
+	btsnoop->cur_size += BTSNOOP_PKT_SIZE;
+
 	if (data && size > 0) {
 		written = write(btsnoop->fd, data, size);
 		if (written < 0)
 			return false;
 	}
+
+	btsnoop->cur_size += size;
 
 	return true;
 }
@@ -242,22 +317,25 @@ static uint32_t get_flags_from_opcode(uint16_t opcode)
 	case BTSNOOP_OPCODE_SCO_TX_PKT:
 	case BTSNOOP_OPCODE_SCO_RX_PKT:
 		break;
+	case BTSNOOP_OPCODE_OPEN_INDEX:
+	case BTSNOOP_OPCODE_CLOSE_INDEX:
+		break;
 	}
 
 	return 0xff;
 }
 
 bool btsnoop_write_hci(struct btsnoop *btsnoop, struct timeval *tv,
-					uint16_t index, uint16_t opcode,
-					const void *data, uint16_t size)
+			uint16_t index, uint16_t opcode, uint32_t drops,
+			const void *data, uint16_t size)
 {
 	uint32_t flags;
 
 	if (!btsnoop)
 		return false;
 
-	switch (btsnoop->type) {
-	case BTSNOOP_TYPE_HCI:
+	switch (btsnoop->format) {
+	case BTSNOOP_FORMAT_HCI:
 		if (btsnoop->index == 0xffff)
 			btsnoop->index = index;
 
@@ -269,7 +347,7 @@ bool btsnoop_write_hci(struct btsnoop *btsnoop, struct timeval *tv,
 			return false;
 		break;
 
-	case BTSNOOP_TYPE_MONITOR:
+	case BTSNOOP_FORMAT_MONITOR:
 		flags = (index << 16) | opcode;
 		break;
 
@@ -277,7 +355,7 @@ bool btsnoop_write_hci(struct btsnoop *btsnoop, struct timeval *tv,
 		return false;
 	}
 
-	return btsnoop_write(btsnoop, tv, flags, data, size);
+	return btsnoop_write(btsnoop, tv, flags, drops, data, size);
 }
 
 bool btsnoop_write_phy(struct btsnoop *btsnoop, struct timeval *tv,
@@ -288,8 +366,8 @@ bool btsnoop_write_phy(struct btsnoop *btsnoop, struct timeval *tv,
 	if (!btsnoop)
 		return false;
 
-	switch (btsnoop->type) {
-	case BTSNOOP_TYPE_SIMULATOR:
+	switch (btsnoop->format) {
+	case BTSNOOP_FORMAT_SIMULATOR:
 		flags = (1 << 16) | frequency;
 		break;
 
@@ -297,23 +375,7 @@ bool btsnoop_write_phy(struct btsnoop *btsnoop, struct timeval *tv,
 		return false;
 	}
 
-	return btsnoop_write(btsnoop, tv, flags, data, size);
-}
-
-static uint16_t get_opcode_from_pklg(uint8_t type)
-{
-	switch (type) {
-	case 0x00:
-		return BTSNOOP_OPCODE_COMMAND_PKT;
-	case 0x01:
-		return BTSNOOP_OPCODE_EVENT_PKT;
-	case 0x02:
-		return BTSNOOP_OPCODE_ACL_TX_PKT;
-	case 0x03:
-		return BTSNOOP_OPCODE_ACL_RX_PKT;
-	}
-
-	return 0xffff;
+	return btsnoop_write(btsnoop, tv, flags, 0, data, size);
 }
 
 static bool pklg_read_hci(struct btsnoop *btsnoop, struct timeval *tv,
@@ -334,14 +396,50 @@ static bool pklg_read_hci(struct btsnoop *btsnoop, struct timeval *tv,
 		return false;
 	}
 
-	toread = be32toh(pkt.len) - 9;
+	if (btsnoop->pklg_v2) {
+		toread = le32toh(pkt.len) - (PKLG_PKT_SIZE - 4);
 
-	ts = be64toh(pkt.ts);
-	tv->tv_sec = ts >> 32;
-	tv->tv_usec = ts & 0xffffffff;
+		ts = le64toh(pkt.ts);
+		tv->tv_sec = ts & 0xffffffff;
+		tv->tv_usec = ts >> 32;
+	} else {
+		toread = be32toh(pkt.len) - (PKLG_PKT_SIZE - 4);
 
-	*index = 0;
-	*opcode = get_opcode_from_pklg(pkt.type);
+		ts = be64toh(pkt.ts);
+		tv->tv_sec = ts >> 32;
+		tv->tv_usec = ts & 0xffffffff;
+	}
+
+	switch (pkt.type) {
+	case 0x00:
+		*index = 0x0000;
+		*opcode = BTSNOOP_OPCODE_COMMAND_PKT;
+		break;
+	case 0x01:
+		*index = 0x0000;
+		*opcode = BTSNOOP_OPCODE_EVENT_PKT;
+		break;
+	case 0x02:
+		*index = 0x0000;
+		*opcode = BTSNOOP_OPCODE_ACL_TX_PKT;
+		break;
+	case 0x03:
+		*index = 0x0000;
+		*opcode = BTSNOOP_OPCODE_ACL_RX_PKT;
+		break;
+	case 0x0b:
+		*index = 0x0000;
+		*opcode = BTSNOOP_OPCODE_VENDOR_DIAG;
+		break;
+	case 0xfc:
+		*index = 0xffff;
+		*opcode = BTSNOOP_OPCODE_SYSTEM_NOTE;
+		break;
+	default:
+		*index = 0xffff;
+		*opcode = 0xffff;
+		break;
+	}
 
 	len = read(btsnoop->fd, data, toread);
 	if (len < 0) {
@@ -426,13 +524,13 @@ bool btsnoop_read_hci(struct btsnoop *btsnoop, struct timeval *tv,
 	tv->tv_sec = (ts / 1000000ll) + 946684800ll;
 	tv->tv_usec = ts % 1000000ll;
 
-	switch (btsnoop->type) {
-	case BTSNOOP_TYPE_HCI:
+	switch (btsnoop->format) {
+	case BTSNOOP_FORMAT_HCI:
 		*index = 0;
 		*opcode = get_opcode_from_flags(0xff, flags);
 		break;
 
-	case BTSNOOP_TYPE_UART:
+	case BTSNOOP_FORMAT_UART:
 		len = read(btsnoop->fd, &pkt_type, 1);
 		if (len < 0) {
 			btsnoop->aborted = true;
@@ -444,7 +542,7 @@ bool btsnoop_read_hci(struct btsnoop *btsnoop, struct timeval *tv,
 		*opcode = get_opcode_from_flags(pkt_type, flags);
 		break;
 
-	case BTSNOOP_TYPE_MONITOR:
+	case BTSNOOP_FORMAT_MONITOR:
 		*index = flags >> 16;
 		*opcode = flags & 0xffff;
 		break;

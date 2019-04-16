@@ -1,5 +1,5 @@
 AC_PREREQ(2.60)
-AC_INIT(bluez, 5.23)
+AC_INIT(bluez, 5.50)
 
 AM_INIT_AUTOMAKE([foreign subdir-objects color-tests silent-rules
 					tar-pax no-dist-gzip dist-xz])
@@ -32,6 +32,16 @@ m4_ifdef([AC_LIBTOOL_TAGS], [AC_LIBTOOL_TAGS([])])
 AC_DISABLE_STATIC
 AC_PROG_LIBTOOL
 
+if (test "$USE_MAINTAINER_MODE" = "yes"); then
+	AC_CHECK_PROG(enable_coverage, [lcov], [yes], [no])
+	AC_CHECK_PROG(enable_dbus_run_session, [dbus-run-session], [yes])
+	AC_CHECK_PROG(enable_valgrind, [valgrind], [yes])
+	AC_CHECK_HEADERS(valgrind/memcheck.h)
+fi
+AM_CONDITIONAL(COVERAGE, test "${enable_coverage}" = "yes")
+AM_CONDITIONAL(DBUS_RUN_SESSION, test "${enable_dbus_run_session}" = "yes")
+AM_CONDITIONAL(VALGRIND, test "${enable_valgrind}" = "yes")
+
 MISC_FLAGS
 
 AC_ARG_ENABLE(threads, AC_HELP_STRING([--enable-threads],
@@ -48,6 +58,8 @@ AC_CHECK_LIB(pthread, pthread_create, dummy=yes,
 
 AC_CHECK_LIB(dl, dlopen, dummy=yes,
 			AC_MSG_ERROR(dynamic linking loader is required))
+
+AC_CHECK_HEADERS(linux/types.h linux/if_alg.h)
 
 PKG_CHECK_MODULES(GLIB, glib-2.0 >= 2.28, dummy=yes,
 				AC_MSG_ERROR(GLib >= 2.28 is required))
@@ -106,6 +118,20 @@ if (test -z "${path_dbussessionbusdir}"); then
 fi
 AC_SUBST(DBUS_SESSIONBUSDIR, [${path_dbussessionbusdir}])
 
+AC_ARG_ENABLE(backtrace, AC_HELP_STRING([--enable-backtrace],
+		[compile backtrace support]), [enable_backtrace=${enableval}])
+
+if (test "${enable_backtrace}" = "yes"); then
+	AC_CHECK_HEADER(elfutils/libdwfl.h, dummy=yes,
+			AC_MSG_ERROR(elfutils support is required))
+	AC_DEFINE(HAVE_BACKTRACE_SUPPORT, 1,
+			[Define to 1 if you have the backtrace support.])
+	BACKTRACE_CFLAGS=""
+	BACKTRACE_LIBS="-ldw"
+	AC_SUBST(BACKTRACE_CFLAGS)
+	AC_SUBST(BACKTRACE_LIBS)
+fi
+
 AC_ARG_ENABLE(library, AC_HELP_STRING([--enable-library],
 		[install Bluetooth library]), [enable_library=${enableval}])
 AM_CONDITIONAL(LIBRARY, test "${enable_library}" = "yes")
@@ -113,6 +139,38 @@ AM_CONDITIONAL(LIBRARY, test "${enable_library}" = "yes")
 AC_ARG_ENABLE(test, AC_HELP_STRING([--enable-test],
 		[enable test/example scripts]), [enable_test=${enableval}])
 AM_CONDITIONAL(TEST, test "${enable_test}" = "yes")
+
+AC_ARG_ENABLE(nfc, AC_HELP_STRING([--enable-nfc],
+		[enable NFC paring]), [enable_nfc=${enableval}])
+AM_CONDITIONAL(NFC, test "${enable_nfc}" = "yes")
+
+AC_ARG_ENABLE(sap, AC_HELP_STRING([--enable-sap],
+		[enable SAP profile]), [enable_sap=${enableval}])
+AM_CONDITIONAL(SAP, test "${enable_sap}" = "yes")
+
+AC_ARG_ENABLE(a2dp, AC_HELP_STRING([--disable-a2dp],
+		[disable A2DP profile]), [enable_a2dp=${enableval}])
+AM_CONDITIONAL(A2DP, test "${enable_a2dp}" != "no")
+
+AC_ARG_ENABLE(avrcp, AC_HELP_STRING([--disable-avrcp],
+		[disable AVRCP profile]), [enable_avrcp=${enableval}])
+AM_CONDITIONAL(AVRCP, test "${enable_avrcp}" != "no")
+
+AC_ARG_ENABLE(network, AC_HELP_STRING([--disable-network],
+		[disable network profiles]), [enable_network=${enableval}])
+AM_CONDITIONAL(NETWORK, test "${enable_network}" != "no")
+
+AC_ARG_ENABLE(hid, AC_HELP_STRING([--disable-hid],
+		[disable HID profile]), [enable_hid=${enableval}])
+AM_CONDITIONAL(HID, test "${enable_hid}" != "no")
+
+AC_ARG_ENABLE(hog, AC_HELP_STRING([--disable-hog],
+		[disable HoG profile]), [enable_hog=${enableval}])
+AM_CONDITIONAL(HOG, test "${enable_hog}" != "no")
+
+AC_ARG_ENABLE(health, AC_HELP_STRING([--enable-health],
+		[enable health profiles]), [enable_health=${enableval}])
+AM_CONDITIONAL(HEALTH, test "${enable_health}" = "yes")
 
 AC_ARG_ENABLE(tools, AC_HELP_STRING([--disable-tools],
 		[disable Bluetooth tools]), [enable_tools=${enableval}])
@@ -154,6 +212,28 @@ AC_ARG_ENABLE(cups, AC_HELP_STRING([--disable-cups],
                 [disable CUPS printer support]), [enable_cups=${enableval}])
 AM_CONDITIONAL(CUPS, test "${enable_cups}" != "no")
 
+AC_ARG_ENABLE(mesh, AC_HELP_STRING([--enable-mesh],
+		[enable Mesh profile support]), [enable_mesh=${enableval}])
+AM_CONDITIONAL(MESH, test "${enable_mesh}" = "yes")
+
+if (test "${enable_mesh}" == "yes"); then
+	PKG_CHECK_MODULES(JSONC, json-c, dummy=yes,
+				AC_MSG_ERROR(json-c is required))
+	AC_SUBST(JSON_CFLAGS)
+	AC_SUBST(JSON_LIBS)
+fi
+
+AC_ARG_ENABLE(midi, AC_HELP_STRING([--enable-midi],
+                [enable MIDI support]), [enable_midi=${enableval}])
+AM_CONDITIONAL(MIDI, test "${enable_midi}" = "yes")
+
+if (test "${enable_midi}" = "yes"); then
+	PKG_CHECK_MODULES(ALSA, alsa, dummy=yes,
+				AC_MSG_ERROR(ALSA lib is required for MIDI support))
+	AC_SUBST(ALSA_CFLAGS)
+	AC_SUBST(ALSA_LIBS)
+fi
+
 AC_ARG_ENABLE(obex, AC_HELP_STRING([--disable-obex],
 		[disable OBEX profile support]), [enable_obex=${enableval}])
 if (test "${enable_obex}" != "no"); then
@@ -164,11 +244,23 @@ if (test "${enable_obex}" != "no"); then
 fi
 AM_CONDITIONAL(OBEX, test "${enable_obex}" != "no")
 
+AC_ARG_ENABLE(btpclient, AC_HELP_STRING([--enable-btpclient],
+		[enable BTP client]), [enable_btpclient=${enableval}])
+AM_CONDITIONAL(BTPCLIENT, test "${enable_btpclient}" = "yes")
+
+if (test "${enable_btpclient}" = "yes" || test "${enable_mesh}" = "yes"); then
+	PKG_CHECK_MODULES(ELL, ell >= 0.3, enable_ell=yes,
+			  AC_MSG_ERROR(ell library >= 0.3 is required))
+	AC_SUBST(ELL_CFLAGS)
+	AC_SUBST(ELL_LIBS)
+fi
+AM_CONDITIONAL(ELL, test "${enable_ell}" = "yes")
+
 AC_ARG_ENABLE(client, AC_HELP_STRING([--disable-client],
 		[disable command line client]), [enable_client=${enableval}])
 AM_CONDITIONAL(CLIENT, test "${enable_client}" != "no")
 
-if (test "${enable_client}" != "no"); then
+if (test "${enable_client}" != "no" || test "${enable_mesh}" == "yes"); then
         AC_CHECK_HEADERS(readline/readline.h, enable_readline=yes,
                 AC_MSG_ERROR(readline header files are required))
 fi
@@ -216,15 +308,29 @@ AC_ARG_ENABLE(manpages, AC_HELP_STRING([--enable-manpages],
 					[enable_manpages=${enableval}])
 AM_CONDITIONAL(MANPAGES, test "${enable_manpages}" = "yes")
 
+AC_ARG_ENABLE(testing, AC_HELP_STRING([--enable-testing],
+			[enable testing tools]),
+					[enable_testing=${enableval}])
+AM_CONDITIONAL(TESTING, test "${enable_testing}" = "yes")
+
 AC_ARG_ENABLE(experimental, AC_HELP_STRING([--enable-experimental],
-			[enable experimental plugins (SAP, NFC, ...)]),
+			[enable experimental tools]),
 					[enable_experimental=${enableval}])
 AM_CONDITIONAL(EXPERIMENTAL, test "${enable_experimental}" = "yes")
+
+AC_ARG_ENABLE(deprecated, AC_HELP_STRING([--enable-deprecated],
+			[enable deprecated tools]),
+					[enable_deprecated=${enableval}])
+AM_CONDITIONAL(DEPRECATED, test "${enable_deprecated}" = "yes")
 
 AC_ARG_ENABLE(sixaxis, AC_HELP_STRING([--enable-sixaxis],
 		[enable sixaxis plugin]), [enable_sixaxis=${enableval}])
 AM_CONDITIONAL(SIXAXIS, test "${enable_sixaxis}" = "yes" &&
 					 test "${enable_udev}" != "no")
+
+AC_ARG_ENABLE(logger, AC_HELP_STRING([--enable-logger],
+		[enable HCI logger service]), [enable_logger=${enableval}])
+AM_CONDITIONAL(LOGGER, test "${enable_logger}" = "yes")
 
 if (test "${prefix}" = "NONE"); then
 	dnl no prefix and no localstatedir, so default to /var

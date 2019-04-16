@@ -35,20 +35,21 @@
 #include <getopt.h>
 #include <termios.h>
 #include <sys/ioctl.h>
-#include <sys/poll.h>
+#include <poll.h>
 
-#include <bluetooth/bluetooth.h>
-#include <bluetooth/hci.h>
-#include <bluetooth/hci_lib.h>
+#include "lib/bluetooth.h"
+#include "lib/hci.h"
+#include "lib/hci_lib.h"
 
 #include "hciattach.h"
-#include "monitor/mainloop.h"
 #include "monitor/bt.h"
+#include "src/shared/mainloop.h"
 #include "src/shared/timeout.h"
 #include "src/shared/util.h"
+#include "src/shared/tty.h"
 #include "src/shared/hci.h"
 
-static int open_serial(const char *path)
+static int open_serial(const char *path, unsigned int speed, bool flowctl)
 {
 	struct termios ti;
 	int fd, saved_ldisc, ldisc = N_HCI;
@@ -75,10 +76,12 @@ static int open_serial(const char *path)
 	memset(&ti, 0, sizeof(ti));
 	cfmakeraw(&ti);
 
-	ti.c_cflag |= (B115200 | CLOCAL | CREAD);
+	ti.c_cflag |= (speed | CLOCAL | CREAD);
 
-	/* Set flow control */
-	ti.c_cflag |= CRTSCTS;
+	if (flowctl) {
+		/* Set flow control */
+		ti.c_cflag |= CRTSCTS;
+	}
 
 	if (tcsetattr(fd, TCSANOW, &ti) < 0) {
 		perror("Failed to set serial port settings");
@@ -106,11 +109,11 @@ static void local_version_callback(const void *data, uint8_t size,
 }
 
 static int attach_proto(const char *path, unsigned int proto,
-						unsigned int flags)
+			unsigned int speed, bool flowctl, unsigned int flags)
 {
 	int fd, dev_id;
 
-	fd = open_serial(path);
+	fd = open_serial(path, speed, flowctl);
 	if (fd < 0)
 		return -1;
 
@@ -154,7 +157,8 @@ static int attach_proto(const char *path, unsigned int proto,
 		}
 
 		bt_hci_send(hci, BT_HCI_CMD_READ_LOCAL_VERSION, NULL, 0,
-					local_version_callback, NULL, NULL);
+					local_version_callback, hci,
+					(bt_hci_destroy_func_t) bt_hci_unref);
 	}
 
 	return fd;
@@ -185,30 +189,56 @@ static void usage(void)
 		"Usage:\n");
 	printf("\tbtattach [options]\n");
 	printf("options:\n"
-		"\t-B, --bredr <device>   Attach BR/EDR controller\n"
+		"\t-B, --bredr <device>   Attach Primary controller\n"
 		"\t-A, --amp <device>     Attach AMP controller\n"
+		"\t-P, --protocol <proto> Specify protocol type\n"
+		"\t-S, --speed <baudrate> Specify which baudrate to use\n"
+		"\t-N, --noflowctl        Disable flow control\n"
 		"\t-h, --help             Show help options\n");
 }
 
 static const struct option main_options[] = {
-	{ "bredr",   required_argument, NULL, 'B' },
-	{ "amp",     required_argument, NULL, 'A' },
-	{ "version", no_argument,       NULL, 'v' },
-	{ "help",    no_argument,       NULL, 'h' },
+	{ "bredr",    required_argument, NULL, 'B' },
+	{ "amp",      required_argument, NULL, 'A' },
+	{ "protocol", required_argument, NULL, 'P' },
+	{ "speed",    required_argument, NULL, 'S' },
+	{ "noflowctl",no_argument,       NULL, 'N' },
+	{ "version",  no_argument,       NULL, 'v' },
+	{ "help",     no_argument,       NULL, 'h' },
+	{ }
+};
+
+static const struct {
+	const char *name;
+	unsigned int id;
+} proto_table[] = {
+	{ "h4",    HCI_UART_H4    },
+	{ "bcsp",  HCI_UART_BCSP  },
+	{ "3wire", HCI_UART_3WIRE },
+	{ "h4ds",  HCI_UART_H4DS  },
+	{ "ll",    HCI_UART_LL    },
+	{ "ath3k", HCI_UART_ATH3K },
+	{ "intel", HCI_UART_INTEL },
+	{ "bcm",   HCI_UART_BCM   },
+	{ "qca",   HCI_UART_QCA   },
+	{ "ag6xx", HCI_UART_AG6XX },
+	{ "nokia", HCI_UART_NOKIA },
+	{ "mrvl",  HCI_UART_MRVL  },
 	{ }
 };
 
 int main(int argc, char *argv[])
 {
-	const char *bredr_path = NULL, *amp_path = NULL;
-	bool raw_device = false;
+	const char *bredr_path = NULL, *amp_path = NULL, *proto = NULL;
+	bool flowctl = true, raw_device = false;
 	sigset_t mask;
-	int exit_status, count = 0;
+	int exit_status, count = 0, proto_id = HCI_UART_H4;
+	unsigned int speed = B115200;
 
 	for (;;) {
 		int opt;
 
-		opt = getopt_long(argc, argv, "B:A:Rvh",
+		opt = getopt_long(argc, argv, "B:A:P:S:NRvh",
 						main_options, NULL);
 		if (opt < 0)
 			break;
@@ -219,6 +249,19 @@ int main(int argc, char *argv[])
 			break;
 		case 'A':
 			amp_path = optarg;
+			break;
+		case 'P':
+			proto = optarg;
+			break;
+		case 'S':
+			speed = tty_get_speed(atoi(optarg));
+			if (!speed) {
+				fprintf(stderr, "Invalid speed: %s\n", optarg);
+				return EXIT_FAILURE;
+			}
+			break;
+		case 'N':
+			flowctl = false;
 			break;
 		case 'R':
 			raw_device = true;
@@ -247,18 +290,34 @@ int main(int argc, char *argv[])
 
 	mainloop_set_signal(&mask, signal_callback, NULL, NULL);
 
+	if (proto) {
+		unsigned int i;
+
+		for (i = 0; proto_table[i].name; i++) {
+			if (!strcmp(proto_table[i].name, proto)) {
+				proto_id = proto_table[i].id;
+				break;
+			}
+		}
+
+		if (!proto_table[i].name) {
+			fprintf(stderr, "Invalid protocol\n");
+			return EXIT_FAILURE;
+		}
+	}
+
 	if (bredr_path) {
 		unsigned long flags;
 		int fd;
 
-		printf("Attaching BR/EDR controller to %s\n", bredr_path);
+		printf("Attaching Primary controller to %s\n", bredr_path);
 
 		flags = (1 << HCI_UART_RESET_ON_INIT);
 
 		if (raw_device)
 			flags = (1 << HCI_UART_RAW_DEVICE);
 
-		fd = attach_proto(bredr_path, HCI_UART_H4, flags);
+		fd = attach_proto(bredr_path, proto_id, speed, flowctl, flags);
 		if (fd >= 0) {
 			mainloop_add_fd(fd, 0, uart_callback, NULL, NULL);
 			count++;
@@ -277,7 +336,7 @@ int main(int argc, char *argv[])
 		if (raw_device)
 			flags = (1 << HCI_UART_RAW_DEVICE);
 
-		fd = attach_proto(amp_path, HCI_UART_H4, flags);
+		fd = attach_proto(amp_path, proto_id, speed, flowctl, flags);
 		if (fd >= 0) {
 			mainloop_add_fd(fd, 0, uart_callback, NULL, NULL);
 			count++;

@@ -27,8 +27,8 @@
 #include <string.h>
 #include <errno.h>
 
-#include "gobex.h"
-#include "gobex-debug.h"
+#include "gobex/gobex.h"
+#include "gobex/gobex-debug.h"
 
 #define FIRST_PACKET_TIMEOUT 60
 
@@ -296,7 +296,7 @@ guint g_obex_put_req_pkt(GObex *obex, GObexPacket *req,
 
 guint g_obex_put_req(GObex *obex, GObexDataProducer data_func,
 			GObexFunc complete_func, gpointer user_data,
-			GError **err, guint8 first_hdr_id, ...)
+			GError **err, guint first_hdr_id, ...)
 {
 	GObexPacket *req;
 	va_list args;
@@ -414,7 +414,7 @@ done:
 guint g_obex_put_rsp(GObex *obex, GObexPacket *req,
 			GObexDataConsumer data_func, GObexFunc complete_func,
 			gpointer user_data, GError **err,
-			guint8 first_hdr_id, ...)
+			guint first_hdr_id, ...)
 {
 	struct transfer *transfer;
 	va_list args;
@@ -424,7 +424,6 @@ guint g_obex_put_rsp(GObex *obex, GObexPacket *req,
 
 	transfer = transfer_new(obex, G_OBEX_OP_PUT, complete_func, user_data);
 	transfer->data_consumer = data_func;
-
 
 	va_start(args, first_hdr_id);
 	transfer_put_req_first(transfer, req, first_hdr_id, args);
@@ -472,7 +471,7 @@ guint g_obex_get_req_pkt(GObex *obex, GObexPacket *req,
 
 guint g_obex_get_req(GObex *obex, GObexDataConsumer data_func,
 			GObexFunc complete_func, gpointer user_data,
-			GError **err, guint8 first_hdr_id, ...)
+			GError **err, guint first_hdr_id, ...)
 {
 	struct transfer *transfer;
 	GObexPacket *req;
@@ -618,7 +617,7 @@ guint g_obex_get_rsp_pkt(GObex *obex, GObexPacket *rsp,
 
 guint g_obex_get_rsp(GObex *obex, GObexDataProducer data_func,
 			GObexFunc complete_func, gpointer user_data,
-			GError **err, guint8 first_hdr_id, ...)
+			GError **err, guint first_hdr_id, ...)
 {
 	GObexPacket *rsp;
 	va_list args;

@@ -258,7 +258,8 @@ static DBusHandlerResult process_message(DBusConnection *connection,
 
 	reply = method->function(connection, message, iface_user_data);
 
-	if (method->flags & G_DBUS_METHOD_FLAG_NOREPLY) {
+	if (method->flags & G_DBUS_METHOD_FLAG_NOREPLY ||
+					dbus_message_get_no_reply(message)) {
 		if (reply != NULL)
 			dbus_message_unref(reply);
 		return DBUS_HANDLER_RESULT_HANDLED;
@@ -634,10 +635,18 @@ static gboolean g_dbus_args_have_signature(const GDBusArgInfo *args,
 
 static void add_pending(struct generic_data *data)
 {
-	if (data->process_id > 0)
-		return;
+	guint old_id = data->process_id;
 
 	data->process_id = g_idle_add(process_changes, data);
+
+	if (old_id > 0) {
+		/*
+		 * If the element already had an old idler, remove the old one,
+		 * no need to re-add it to the pending list.
+		 */
+		g_source_remove(old_id);
+		return;
+	}
 
 	pending = g_slist_append(pending, data);
 }
@@ -1412,7 +1421,14 @@ DBusMessage *g_dbus_create_error_valist(DBusMessage *message, const char *name,
 {
 	char str[1024];
 
-	vsnprintf(str, sizeof(str), format, args);
+	/* Check if the message can be replied */
+	if (dbus_message_get_no_reply(message))
+		return NULL;
+
+	if (format)
+		vsnprintf(str, sizeof(str), format, args);
+	else
+		str[0] = '\0';
 
 	return dbus_message_new_error(message, name, str);
 }
@@ -1436,6 +1452,10 @@ DBusMessage *g_dbus_create_reply_valist(DBusMessage *message,
 						int type, va_list args)
 {
 	DBusMessage *reply;
+
+	/* Check if the message can be replied */
+	if (dbus_message_get_no_reply(message))
+		return NULL;
 
 	reply = dbus_message_new_method_return(message);
 	if (reply == NULL)
@@ -1481,6 +1501,9 @@ static void g_dbus_flush(DBusConnection *connection)
 gboolean g_dbus_send_message(DBusConnection *connection, DBusMessage *message)
 {
 	dbus_bool_t result = FALSE;
+
+	if (!message)
+		return FALSE;
 
 	if (dbus_message_get_type(message) == DBUS_MESSAGE_TYPE_METHOD_CALL)
 		dbus_message_set_no_reply(message, TRUE);
@@ -1530,11 +1553,8 @@ gboolean g_dbus_send_error_valist(DBusConnection *connection,
 					const char *format, va_list args)
 {
 	DBusMessage *error;
-	char str[1024];
 
-	vsnprintf(str, sizeof(str), format, args);
-
-	error = dbus_message_new_error(message, name, str);
+	error = g_dbus_create_error_valist(message, name, format, args);
 	if (error == NULL)
 		return FALSE;
 
@@ -1562,14 +1582,9 @@ gboolean g_dbus_send_reply_valist(DBusConnection *connection,
 {
 	DBusMessage *reply;
 
-	reply = dbus_message_new_method_return(message);
-	if (reply == NULL)
+	reply = g_dbus_create_reply_valist(message, type, args);
+	if (!reply)
 		return FALSE;
-
-	if (dbus_message_append_args_valist(reply, type, args) == FALSE) {
-		dbus_message_unref(reply);
-		return FALSE;
-	}
 
 	return g_dbus_send_message(connection, reply);
 }
@@ -1650,8 +1665,6 @@ static void process_properties_from_interface(struct generic_data *data,
 	DBusMessageIter iter, dict, array;
 	GSList *invalidated;
 
-	data->pending_prop = FALSE;
-
 	if (iface->pending_prop == NULL)
 		return;
 
@@ -1713,6 +1726,8 @@ static void process_property_changes(struct generic_data *data)
 {
 	GSList *l;
 
+	data->pending_prop = FALSE;
+
 	for (l = data->interfaces; l != NULL; l = l->next) {
 		struct interface_data *iface = l->data;
 
@@ -1720,9 +1735,10 @@ static void process_property_changes(struct generic_data *data)
 	}
 }
 
-void g_dbus_emit_property_changed(DBusConnection *connection,
+void g_dbus_emit_property_changed_full(DBusConnection *connection,
 				const char *path, const char *interface,
-				const char *name)
+				const char *name,
+				GDbusPropertyChangedFlags flags)
 {
 	const GDBusPropertyTable *property;
 	struct generic_data *data;
@@ -1760,7 +1776,16 @@ void g_dbus_emit_property_changed(DBusConnection *connection,
 	iface->pending_prop = g_slist_prepend(iface->pending_prop,
 						(void *) property);
 
-	add_pending(data);
+	if (flags & G_DBUS_PROPERTY_CHANGED_FLAG_FLUSH)
+		process_property_changes(data);
+	else
+		add_pending(data);
+}
+
+void g_dbus_emit_property_changed(DBusConnection *connection, const char *path,
+				const char *interface, const char *name)
+{
+	g_dbus_emit_property_changed_full(connection, path, interface, name, 0);
 }
 
 gboolean g_dbus_get_properties(DBusConnection *connection, const char *path,
@@ -1815,4 +1840,9 @@ gboolean g_dbus_detach_object_manager(DBusConnection *connection)
 void g_dbus_set_flags(int flags)
 {
 	global_flags = flags;
+}
+
+int g_dbus_get_flags(void)
+{
+	return global_flags;
 }

@@ -32,7 +32,7 @@
 #include <signal.h>
 #include <string.h>
 #include <libgen.h>
-#include <sys/poll.h>
+#include <poll.h>
 #include <sys/wait.h>
 #include <sys/param.h>
 #include <sys/socket.h>
@@ -40,7 +40,11 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#include "monitor/mainloop.h"
+#ifndef WAIT_ANY
+#define WAIT_ANY (-1)
+#endif
+
+#include "src/shared/mainloop.h"
 
 static char exec_dir[PATH_MAX];
 
@@ -82,7 +86,7 @@ static void run_bluetoothd(char *prg_name)
 
 static void ctl_start(void)
 {
-	char prg_name[PATH_MAX];
+	char prg_name[PATH_MAX + 11];
 	pid_t pid;
 
 	snprintf(prg_name, sizeof(prg_name), "%s/%s", exec_dir, "bluetoothd");
@@ -110,7 +114,7 @@ static void ctl_start(void)
 
 static void snoop_start(void)
 {
-	char prg_name[PATH_MAX];
+	char prg_name[PATH_MAX + 17];
 	char *prg_argv[3];
 	char *prg_envp[1];
 	pid_t pid;

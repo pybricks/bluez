@@ -36,7 +36,8 @@
 
 #include <glib.h>
 #include <dbus/dbus.h>
-#include <gdbus/gdbus.h>
+
+#include "gdbus/gdbus.h"
 
 #include "src/log.h"
 #include "src/dbus-common.h"
@@ -586,30 +587,6 @@ static void parse_folder_list(gpointer data, gpointer user_data)
 	dbus_message_iter_close_container(array, &entry);
 }
 
-void media_player_change_folder_complete(struct media_player *mp,
-						const char *path, int ret)
-{
-	struct media_folder *folder = mp->scope;
-	DBusMessage *reply;
-
-	if (folder == NULL || folder->msg == NULL)
-		return;
-
-	if (ret < 0) {
-		reply = btd_error_failed(folder->msg, strerror(-ret));
-		goto done;
-	}
-
-	media_player_set_folder(mp, path, ret);
-
-	reply = g_dbus_create_reply(folder->msg, DBUS_TYPE_INVALID);
-
-done:
-	g_dbus_send_message(btd_get_dbus_connection(), reply);
-	dbus_message_unref(folder->msg);
-	folder->msg = NULL;
-}
-
 void media_player_list_complete(struct media_player *mp, GSList *items,
 								int err)
 {
@@ -699,6 +676,23 @@ done:
 	g_dbus_send_message(btd_get_dbus_connection(), reply);
 	dbus_message_unref(folder->msg);
 	folder->msg = NULL;
+}
+
+void media_player_total_items_complete(struct media_player *mp,
+							uint32_t num_of_items)
+{
+	struct media_folder *folder = mp->scope;
+
+	if (folder == NULL || folder->msg == NULL)
+		return;
+
+	if (folder->number_of_items != num_of_items) {
+		folder->number_of_items = num_of_items;
+
+		g_dbus_emit_property_changed(btd_get_dbus_connection(),
+				mp->path, MEDIA_FOLDER_INTERFACE,
+				"NumberOfItems");
+	}
 }
 
 static const GDBusMethodTable media_player_methods[] = {
@@ -890,6 +884,9 @@ static void media_folder_destroy(void *data)
 static void media_player_change_scope(struct media_player *mp,
 						struct media_folder *folder)
 {
+	struct player_callback *cb = mp->cb;
+	int err;
+
 	if (mp->scope == folder)
 		return;
 
@@ -919,10 +916,19 @@ cleanup:
 done:
 	mp->scope = folder;
 
+	if (cb->cbs->total_items) {
+		err = cb->cbs->total_items(mp, folder->item->name,
+							cb->user_data);
+		if (err < 0)
+			DBG("Failed to get total num of items");
+	} else {
+		g_dbus_emit_property_changed(btd_get_dbus_connection(),
+				mp->path, MEDIA_FOLDER_INTERFACE,
+				"NumberOfItems");
+	}
+
 	g_dbus_emit_property_changed(btd_get_dbus_connection(), mp->path,
 				MEDIA_FOLDER_INTERFACE, "Name");
-	g_dbus_emit_property_changed(btd_get_dbus_connection(), mp->path,
-				MEDIA_FOLDER_INTERFACE, "NumberOfItems");
 }
 
 static struct media_folder *find_folder(GSList *folders, const char *pattern)
@@ -1072,10 +1078,8 @@ static const GDBusMethodTable media_folder_methods[] = {
 };
 
 static const GDBusPropertyTable media_folder_properties[] = {
-	{ "Name", "s", get_folder_name, NULL, folder_name_exists,
-					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
-	{ "NumberOfItems", "u", get_items, NULL, items_exists,
-					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
+	{ "Name", "s", get_folder_name, NULL, folder_name_exists },
+	{ "NumberOfItems", "u", get_items, NULL, items_exists },
 	{ }
 };
 
@@ -1097,6 +1101,69 @@ static void media_player_set_scope(struct media_player *mp,
 	}
 
 	return media_player_change_scope(mp, folder);
+}
+
+static struct media_folder *
+media_player_find_folder_by_uid(struct media_player *mp, uint64_t uid)
+{
+	struct media_folder *folder = mp->scope;
+	struct media_folder *parent = folder->parent;
+	GSList *l;
+
+	if (parent && parent->item->uid == uid)
+		return parent;
+
+	for (l = folder->subfolders; l; l = l->next) {
+		struct media_folder *folder = l->data;
+
+		if (folder->item->uid == uid)
+			return folder;
+	}
+
+	return NULL;
+}
+
+static void media_player_set_folder_by_uid(struct media_player *mp,
+					uint64_t uid, uint32_t number_of_items)
+{
+	struct media_folder *folder;
+
+	DBG("uid %" PRIu64 " number of items %u", uid, number_of_items);
+
+	folder = media_player_find_folder_by_uid(mp, uid);
+	if (folder == NULL) {
+		error("Unknown folder: %" PRIu64, uid);
+		return;
+	}
+
+	folder->number_of_items = number_of_items;
+
+	media_player_set_scope(mp, folder);
+}
+
+void media_player_change_folder_complete(struct media_player *mp,
+						const char *path, uint64_t uid,
+						int ret)
+{
+	struct media_folder *folder = mp->scope;
+	DBusMessage *reply;
+
+	if (folder == NULL || folder->msg == NULL)
+		return;
+
+	if (ret < 0) {
+		reply = btd_error_failed(folder->msg, strerror(-ret));
+		goto done;
+	}
+
+	media_player_set_folder_by_uid(mp, uid, ret);
+
+	reply = g_dbus_create_reply(folder->msg, DBUS_TYPE_INVALID);
+
+done:
+	g_dbus_send_message(btd_get_dbus_connection(), reply);
+	dbus_message_unref(folder->msg);
+	folder->msg = NULL;
 }
 
 void media_player_destroy(struct media_player *mp)
@@ -1161,6 +1228,11 @@ struct media_player *media_player_controller_create(const char *path,
 	DBG("%s", mp->path);
 
 	return mp;
+}
+
+const char *media_player_get_path(struct media_player *mp)
+{
+	return mp->path;
 }
 
 void media_player_set_duration(struct media_player *mp, uint32_t duration)
@@ -1371,9 +1443,14 @@ void media_player_set_browsable(struct media_player *mp, bool enabled)
 					"Browsable");
 }
 
+bool media_player_get_browsable(struct media_player *mp)
+{
+	return mp->browsable;
+}
+
 void media_player_set_searchable(struct media_player *mp, bool enabled)
 {
-	if (mp->browsable == enabled)
+	if (mp->searchable == enabled)
 		return;
 
 	DBG("%s", enabled ? "true" : "false");
@@ -1444,17 +1521,26 @@ static DBusMessage *media_item_play(DBusConnection *conn, DBusMessage *msg,
 {
 	struct media_item *item = data;
 	struct media_player *mp = item->player;
+	struct media_folder *folder = mp->scope;
 	struct player_callback *cb = mp->cb;
+	const char *path;
 	int err;
 
 	if (!item->playable || !cb->cbs->play_item)
 		return btd_error_not_supported(msg);
 
-	err = cb->cbs->play_item(mp, item->path, item->uid, cb->user_data);
+	if (folder->msg)
+		return btd_error_failed(msg, strerror(EBUSY));
+
+	path = mp->search && folder == mp->search ? "/Search" : item->path;
+
+	err = cb->cbs->play_item(mp, path, item->uid, cb->user_data);
 	if (err < 0)
 		return btd_error_failed(msg, strerror(-err));
 
-	return g_dbus_create_reply(msg, DBUS_TYPE_INVALID);
+	folder->msg = dbus_message_ref(msg);
+
+	return NULL;
 }
 
 static DBusMessage *media_item_add_to_nowplaying(DBusConnection *conn,
@@ -1643,7 +1729,7 @@ static gboolean get_metadata(const GDBusPropertyTable *property,
 }
 
 static const GDBusMethodTable media_item_methods[] = {
-	{ GDBUS_METHOD("Play", NULL, NULL, media_item_play) },
+	{ GDBUS_ASYNC_METHOD("Play", NULL, NULL, media_item_play) },
 	{ GDBUS_METHOD("AddtoNowPlaying", NULL, NULL,
 					media_item_add_to_nowplaying) },
 	{ }
@@ -1658,6 +1744,27 @@ static const GDBusPropertyTable media_item_properties[] = {
 	{ "Metadata", "a{sv}", get_metadata, NULL, metadata_exists },
 	{ }
 };
+
+void media_player_play_item_complete(struct media_player *mp, int err)
+{
+	struct media_folder *folder = mp->scope;
+	DBusMessage *reply;
+
+	if (folder == NULL || folder->msg == NULL)
+		return;
+
+	if (err < 0) {
+		reply = btd_error_failed(folder->msg, strerror(-err));
+		goto done;
+	}
+
+	reply = g_dbus_create_reply(folder->msg, DBUS_TYPE_INVALID);
+
+done:
+	g_dbus_send_message(btd_get_dbus_connection(), reply);
+	dbus_message_unref(folder->msg);
+	folder->msg = NULL;
+}
 
 void media_item_set_playable(struct media_item *item, bool value)
 {
@@ -1731,22 +1838,6 @@ struct media_item *media_player_create_item(struct media_player *mp,
 						uint64_t uid)
 {
 	return media_folder_create_item(mp, mp->scope, name, type, uid);
-}
-
-static struct media_folder *
-media_player_find_folder_by_uid(struct media_player *mp, uint64_t uid)
-{
-	struct media_folder *folder = mp->scope;
-	GSList *l;
-
-	for (l = folder->subfolders; l; l = l->next) {
-		struct media_folder *folder = l->data;
-
-		if (folder->item->uid == uid)
-			return folder;
-	}
-
-	return NULL;
 }
 
 struct media_item *media_player_create_folder(struct media_player *mp,

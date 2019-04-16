@@ -31,8 +31,10 @@
 #include <unistd.h>
 #include <errno.h>
 
-#include <bluetooth/bluetooth.h>
 #include <glib.h>
+
+#include "lib/bluetooth.h"
+#include "lib/sdp.h"
 
 #include "src/plugin.h"
 #include "src/adapter.h"
@@ -58,13 +60,23 @@ static ssize_t autopair_pincb(struct btd_adapter *adapter,
 {
 	char addr[18];
 	char pinstr[7];
+	char name[25];
 	uint32_t class;
 
 	ba2str(device_get_address(device), addr);
 
 	class = btd_device_get_class(device);
 
-	DBG("device %s 0x%x", addr, class);
+	device_get_name(device, name, sizeof(name));
+
+	DBG("device '%s' (%s) class: 0x%x vid/pid: 0x%X/0x%X",
+		name, addr, class,
+		btd_device_get_vendor (device),
+		btd_device_get_product (device));
+
+	/* The iCade shouldn't use random PINs like normal keyboards */
+	if (name != NULL && strstr(name, "iCade") != NULL)
+		return 0;
 
 	/* This is a class-based pincode guesser. Ignore devices with an
 	 * unknown class.
@@ -108,7 +120,7 @@ static ssize_t autopair_pincb(struct btd_adapter *adapter,
 			if (attempt >= 4)
 				return 0;
 
-			snprintf(pinstr, sizeof(pinstr), "%06d",
+			snprintf(pinstr, sizeof(pinstr), "%06u",
 						rand() % 1000000);
 			*display = true;
 			memcpy(pinbuf, pinstr, 6);
@@ -172,8 +184,8 @@ static int autopair_init(void)
 	n = read(fd, &seed, sizeof(seed));
 	if (n < (ssize_t) sizeof(seed)) {
 		err = (n == -1) ? -errno : -EIO;
-		error("Failed to read %zu bytes from /dev/urandom",
-								sizeof(seed));
+		error("Failed to read %zu bytes from /dev/urandom: %s (%d)",
+					sizeof(seed), strerror(-err), -err);
 		close(fd);
 		return err;
 	}

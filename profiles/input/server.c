@@ -29,21 +29,21 @@
 #include <stdbool.h>
 #include <errno.h>
 
-#include <bluetooth/bluetooth.h>
-#include <bluetooth/sdp.h>
-
 #include <glib.h>
 #include <dbus/dbus.h>
 
-#include "src/log.h"
+#include "lib/bluetooth.h"
+#include "lib/sdp.h"
+#include "lib/uuid.h"
 
+#include "src/log.h"
 #include "src/uuid-helper.h"
 #include "btio/btio.h"
-#include "lib/uuid.h"
 #include "src/adapter.h"
 #include "src/device.h"
 #include "src/profile.h"
 
+#include "sixaxis.h"
 #include "device.h"
 #include "server.h"
 
@@ -124,6 +124,7 @@ static bool dev_is_sixaxis(const bdaddr_t *src, const bdaddr_t *dst)
 {
 	struct btd_device *device;
 	uint16_t vid, pid;
+	const struct cable_pairing *cp;
 
 	device = btd_adapter_find_device(adapter_find(src), dst, BDADDR_BREDR);
 	if (!device)
@@ -132,12 +133,9 @@ static bool dev_is_sixaxis(const bdaddr_t *src, const bdaddr_t *dst)
 	vid = btd_device_get_vendor(device);
 	pid = btd_device_get_product(device);
 
-	/* DualShock 3 */
-	if (vid == 0x054c && pid == 0x0268)
-		return true;
-
-	/* DualShock 4 */
-	if (vid == 0x054c && pid == 0x05c4)
+	cp = get_pairing(vid, pid);
+	if (cp && (cp->type == CABLE_PAIRING_SIXAXIS ||
+					cp->type == CABLE_PAIRING_DS4))
 		return true;
 
 	return false;
