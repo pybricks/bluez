@@ -1,3 +1,9 @@
+bluez (5.52-0ubuntu2pybricks1) bionic; urgency=medium
+
+  * Pybricks takeover
+
+ -- David Lechner <david@lechnology.com>  Mon, 27 Jan 2020 15:24:51 -0600
+
 bluez (5.52-0ubuntu2) focal; urgency=medium
 
   * Don't build bluez-cups on i386.
